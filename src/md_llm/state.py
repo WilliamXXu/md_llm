@@ -75,9 +75,13 @@ def _display_name_for_filepath(path):
 # autossh scaffolding (shared by .autossh): default configs + widget-key builder
 # ---------------------------------------------------------------------------
 
-# Default autossh tunnel for an LLM server (Ollama on :11434). Every field is
-# editable in the panel where it's rendered; these just seed the form. Empty
-# identity / ssh_host by default (no host baked in for a generic package).
+# Host-neutral fallback for an LLM-server (Ollama on :11434) autossh tunnel.
+# This only seeds settings.json on the FIRST run of a panel (seed-on-first-run,
+# mirroring the llm panel pattern); after that the persisted per-panel subkey
+# (e.g. ``chat_autossh``) is the source of truth and this constant only
+# backfills any missing field. No host-specific address is baked in — a host
+# injects its own server via settings.json (the host project does this via a
+# one-time migration on startup).
 DEFAULT_LLM_AUTOSSH = {
     "identity": "~/.ssh/id_ed25519",
     "local_port": 11434,

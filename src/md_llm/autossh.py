@@ -180,11 +180,22 @@ def _render_autossh_panel(prefix="chat_", in_sidebar=False, default=None,
         default = DEFAULT_LLM_AUTOSSH
 
     with where.expander(title, expanded=False):
+        # Seed-on-first-run (mirrors the llm panel pattern: defaults live in
+        # settings.json, the module constant is only a host-neutral fallback).
+        # If this panel's subkey is absent from settings.json, write the default
+        # config there once so the "default" is itself persisted and editable
+        # like any user value. On later runs the saved subkey is the source of
+        # truth; the constant only backfills any field the saved dict is missing.
+        subkey = _autossh_settings_subkey(prefix)
+        settings = get_core().load_settings()
+        saved = settings.get(subkey)
+        if not saved:
+            saved = dict(default)
+            settings[subkey] = saved
+            get_core().save_settings(settings)
         cfg = dict(default)
         cfg.update({
-            f: v for f, v in (
-                get_core().load_settings().get(_autossh_settings_subkey(prefix)) or {}
-            ).items()
+            f: v for f, v in saved.items()
             if f in default and v is not None
         })
 

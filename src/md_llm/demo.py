@@ -19,6 +19,45 @@ import streamlit as st
 import md_llm
 
 
+def _list_documents(root):
+    """Collect .md/.txt files under ``root``, top-level files first.
+
+    Returns the list of *relpaths* (relative to ``root``) the selectbox will
+    show. Files directly in ``root`` come first (bare names, sorted); then each
+    subfolder's files are listed in turn, shown as ``subdir/file`` so the nested
+    path is visible in the dropdown. Hidden files/dirs (leading dot) and the
+    chat-save subdir (``_chats``) are skipped. Relpaths are what
+    ``open_in_reader`` stages, so the reader resolves them against ``base_dir``
+    (= ``root``) correctly whether the file is at the top or nested.
+    """
+    top_level = sorted(
+        name for name in os.listdir(root)
+        if not name.startswith(".")
+        and os.path.isfile(os.path.join(root, name))
+        and name.endswith((".md", ".txt"))
+    )
+
+    nested = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Skip hidden dirs and the chat-save subdir in-place so os.walk doesn't
+        # descend into them.
+        dirnames[:] = sorted(
+            d for d in dirnames if not d.startswith(".") and d != "_chats"
+        )
+        # Only collect from subfolders; the top level is handled above.
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == ".":
+            continue
+        for name in sorted(filenames):
+            if name.startswith(".") or not name.endswith((".md", ".txt")):
+                continue
+            rel = os.path.join(rel_dir, name)
+            # Normalize for the host OS (so "sub/foo.md" on display everywhere).
+            nested.append(rel.replace(os.sep, "/"))
+
+    return top_level + nested
+
+
 def main():
     st.set_page_config(page_title="md_llm demo", layout="wide")
 
@@ -30,10 +69,7 @@ def main():
         if not os.path.isdir(root):
             st.error("Not a directory.")
             st.stop()
-        files = sorted(
-            f for f in os.listdir(root)
-            if f.endswith((".md", ".txt")) and os.path.isfile(os.path.join(root, f))
-        )
+        files = _list_documents(root)
         if not files:
             st.info("No .md / .txt files in this directory.")
             st.stop()
@@ -50,16 +86,23 @@ def main():
             "Settings persist to `_md_llm_settings.json` there too."
         )
 
-    # Inject the host's facts once per process (idempotent).
-    try:
-        md_llm.get_core()
-    except RuntimeError:
+    # Re-inject the host's facts whenever the directory changes. init() itself
+    # is idempotent (just overwrites the registered core), but it is NOT called
+    # again after the first run, so without this block the Core would keep
+    # pointing at the first directory ever picked — and every staged relpath
+    # would be resolved against that stale base_dir, so files from a newly
+    # chosen directory would silently fail to open.
+    if st.session_state.get("_demo_core_root") != root:
         md_llm.init(md_llm.Core(
             base_dir=root,
             markdown_dirs=(root,),
             chat_save_dir=os.path.join(root, "_chats"),
             settings_path=os.path.join(root, "_md_llm_settings.json"),
         ))
+        # Drop any file staged against the old directory: its relpath is now
+        # ambiguous (a same-named file may exist in the new dir) or stale.
+        st.session_state.pop("_reader_target", None)
+        st.session_state["_demo_core_root"] = root
 
     tabs = st.tabs(
         [md_llm.READER_TAB_LABEL, md_llm.CHAT_TAB_LABEL],
