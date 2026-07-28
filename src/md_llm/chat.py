@@ -32,11 +32,17 @@ from .controls import (
     _current_oai_endpoint,
     _oai_registry_entry,
     _remember_oai_endpoint,
+    _remember_opencode_model,
     _render_llm_controls,
     _save_oai_registry_entry,
 )
 from .core import get_core
-from .state import DEFAULT_LLM_AUTOSSH, _display_name_for_filepath, _read_text
+from .state import (
+    DEFAULT_LLM_AUTOSSH,
+    _BODY_FONT_SIZE_CSS,
+    _display_name_for_filepath,
+    _read_text,
+)
 
 # Session-state keys (session-memory only — nothing persisted except via Save).
 _CHAT_MESSAGES = "_chat_messages"  # list[{"role","content"}]
@@ -270,6 +276,25 @@ def _attach_quote_to_last_turn(turns):
     st.session_state.pop(_READER_QUOTE, None)
 
 
+def _turns_to_opencode_prompt(turns):
+    """Flatten the chat message list into a single prompt for ``opencode run``.
+
+    ``opencode run`` takes one positional prompt (not a message array), so the
+    document-context turn + the Q&A history are rendered as labelled
+    ``User:`` / ``Assistant:`` blocks. The system instruction is passed
+    separately to :func:`md_llm.llm.opencode_chat_stream`, which prepends it.
+    """
+    labels = {"user": "User", "assistant": "Assistant", "system": "System"}
+    parts = []
+    for m in turns:
+        role = m.get("role", "user")
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        parts.append(f"{labels.get(role, role.capitalize())}:\n{content}")
+    return "\n\n".join(parts).strip()
+
+
 def _safe_stream(gen, holder):
     """Yield from ``gen``, capturing its first exception into ``holder``.
 
@@ -346,6 +371,17 @@ def _build_stream(context_path, holder):
         gen = llm.openai_chat_stream(
             turns, api_key=api_key, model=model, endpoint=endpoint,
             instruction=instruction,
+        )
+    elif provider == "OpenCode":
+        workdir = (st.session_state.get(f"{p}llm_opencode_workdir") or "").strip() or None
+        attach = (st.session_state.get(f"{p}llm_opencode_attach") or "").strip() or None
+        agent = (st.session_state.get(f"{p}llm_opencode_agent") or "").strip() or None
+        # Persist the chosen model so it reappears next session.
+        _remember_opencode_model(model)
+        prompt = _turns_to_opencode_prompt(turns)
+        gen = llm.opencode_chat_stream(
+            prompt, model=model, workdir=workdir, attach=attach,
+            agent=agent, instruction=instruction,
         )
     else:
         endpoint = st.session_state.get(
@@ -440,6 +476,10 @@ def render_chat():
         st.rerun()
 
     st.divider()
+
+    # Permanently bump body-text + code font size (scoped to Streamlit's
+    # markdown/code containers; chat-message bodies use the same containers).
+    st.markdown(_BODY_FONT_SIZE_CSS, unsafe_allow_html=True)
 
     # --- Chat history --------------------------------------------------
     messages = st.session_state.get(_CHAT_MESSAGES) or []

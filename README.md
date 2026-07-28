@@ -3,12 +3,17 @@
 A reusable Streamlit component package: a **markdown reader** + **LLM chat**
 panel for any markdown/text files. Plugs into any Streamlit host app.
 
-Three LLM providers (stdlib-only HTTP client, no SDK):
+Four LLM providers (stdlib-only clients, no SDK):
 
 - **Ollama** — local server (optional `autossh` tunnel to a remote box).
 - **OpenRouter** — hosted API keyed by `OPENROUTER_API_KEY`.
 - **OpenAI-compatible** — any `/chat/completions` host (OpenAI, Groq, Together,
   …); models **and** the API key are remembered per endpoint URL.
+- **OpenCode** — the open source coding **agent**, invoked via
+  `opencode run --format json --auto` (subprocess, full agent with tools).
+  Auth/model routing are OpenCode's own; the panel exposes a working directory,
+  an optional `--attach` server URL, and an optional agent. Models come from
+  `opencode models`.
 
 ## Install
 
@@ -59,7 +64,7 @@ set_logger(my_console.log_event)   # md_llm will call this for chat send/reply/e
 ## Standalone demo
 
 ```bash
-streamlit run -m md_llm.demo
+streamlit run src/md_llm/demo.py
 ```
 
 Opens a sidebar directory picker; reads + chats about any `.md` / `.txt` in the
@@ -80,7 +85,7 @@ dict on disk; the OpenAI-compatible endpoint/model/key registry lives under the
 src/md_llm/
 ├── __init__.py   # public API: Core, init, render_reader, render_chat, open_in_reader, TABS_KEY, *_TAB_LABEL
 ├── core.py       # Core dataclass + init/get_core (dependency-injected host config)
-├── llm.py        # stdlib-only LLM clients (Ollama / OpenRouter / OpenAI-compatible)
+├── llm.py        # stdlib-only LLM clients (Ollama / OpenRouter / OpenAI-compatible / OpenCode)
 ├── state.py      # generic helpers: _read_text, _human_size, _display_name_for_filepath
 ├── console.py    # log_event + set_logger hook (forwards to host console)
 ├── controls.py   # provider/model/endpoint widgets + per-endpoint OAI registry

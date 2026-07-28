@@ -11,6 +11,7 @@ Ported from transcriber_system's test_llm_openai.py, retargeted at md_llm.
 
 import io
 import json
+import subprocess
 import unittest
 from unittest import mock
 
@@ -131,6 +132,167 @@ class OpenAIGenerateTests(unittest.TestCase):
         ua = captured["headers"].get("User-agent", "")
         self.assertTrue(ua)
         self.assertNotIn("Python-urllib", ua)
+
+
+class OpencodeListModelsTests(unittest.TestCase):
+    """list_opencode_models shells out to `opencode models` and degrades to []."""
+
+    def test_parses_provider_slash_model_first_token(self):
+        out = (
+            "PROVIDER  MODEL\n"
+            "--------  ------\n"
+            " anthropic/claude-sonnet-420   $3.00\n"
+            "openai/gpt-4o-mini  $0.50\n"
+        )
+        completed = subprocess.CompletedProcess(
+            args=["opencode", "models"], returncode=0, stdout=out, stderr="",
+        )
+        with mock.patch("subprocess.run", return_value=completed):
+            models = llm.list_opencode_models()
+        self.assertEqual(
+            models, ["anthropic/claude-sonnet-420", "openai/gpt-4o-mini"]
+        )
+
+    def test_missing_binary_returns_empty(self):
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertEqual(llm.list_opencode_models(), [])
+
+    def test_nonzero_exit_returns_empty(self):
+        completed = subprocess.CompletedProcess(
+            args=["opencode", "models"], returncode=1, stdout="", stderr="boom",
+        )
+        with mock.patch("subprocess.run", return_value=completed):
+            self.assertEqual(llm.list_opencode_models(), [])
+
+
+class _FakeOpencodeProc:
+    """Minimal stand-in for the Popen object opencode_chat_stream drives."""
+
+    def __init__(self, stdout_lines, returncode=0, stderr_lines=None):
+        self.stdout = iter(stdout_lines)
+        self.stderr = iter(stderr_lines or [])
+        self.returncode = returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+
+class OpencodeChatStreamTests(unittest.TestCase):
+    """opencode_chat_stream parses the JSONL event stream and builds argv."""
+
+    def _capture(self, stdout_lines, returncode=0, stderr_lines=None):
+        captured = {}
+
+        def fake_popen(args, **kwargs):
+            captured["args"] = list(args)
+            captured["kwargs"] = kwargs
+            return _FakeOpencodeProc(stdout_lines, returncode, stderr_lines)
+
+        return captured, fake_popen
+
+    def test_yields_text_deltas_and_tool_marker(self):
+        lines = [
+            json.dumps({"type": "text", "part": {"text": "Hello "}}),
+            json.dumps({"type": "text", "part": {"text": "world"}}),
+            json.dumps({"type": "tool_use",
+                        "part": {"tool": "bash", "state": {"title": "Run ls"}}}),
+            json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
+            "",
+            "not-json",  # non-JSON / blank lines are skipped, not fatal
+        ]
+        captured, fake = self._capture(lines)
+        with mock.patch("subprocess.Popen", side_effect=fake), \
+             mock.patch("os.makedirs") as m_makedirs:
+            out = list(llm.opencode_chat_stream(
+                "hi", model="anthropic/x", workdir="/tmp/s",
+            ))
+        # The workdir is ensured to exist (opencode's --dir chdir requires it).
+        m_makedirs.assert_called_once_with("/tmp/s", exist_ok=True)
+        self.assertEqual(out[:2], ["Hello ", "world"])
+        self.assertTrue(any("🔧" in p and "bash" in p for p in out))
+
+        a = captured["args"]
+        self.assertEqual(a[0], "opencode")
+        self.assertIn("run", a)
+        self.assertIn("--format", a)
+        self.assertEqual(a[a.index("--format") + 1], "json")
+        self.assertIn("--auto", a)
+        self.assertIn("--model", a)
+        self.assertEqual(a[a.index("--model") + 1], "anthropic/x")
+        self.assertIn("--dir", a)
+        self.assertEqual(a[a.index("--dir") + 1], "/tmp/s")
+        # prompt is the trailing positional argument
+        self.assertEqual(a[-1], "hi")
+
+    def test_no_workdir_does_not_create_dirs(self):
+        captured, fake = self._capture(
+            [json.dumps({"type": "text", "part": {"text": "ok"}})]
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake), \
+             mock.patch("os.makedirs") as m_makedirs:
+            list(llm.opencode_chat_stream("hi", model="m"))
+        m_makedirs.assert_not_called()
+
+    def test_workdir_create_failure_raises_runtimeerror(self):
+        with mock.patch("os.makedirs", side_effect=OSError("no perms")):
+            with self.assertRaises(RuntimeError) as cm:
+                list(llm.opencode_chat_stream("hi", model="m", workdir="/no/such"))
+        self.assertIn("working directory", str(cm.exception))
+
+    def test_passes_attach_and_agent_when_given(self):
+        captured, fake = self._capture(
+            [json.dumps({"type": "text", "part": {"text": "ok"}})]
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            list(llm.opencode_chat_stream(
+                "hi", model="m",
+                attach="http://localhost:4096", agent="build",
+            ))
+        a = captured["args"]
+        self.assertEqual(a[a.index("--attach") + 1], "http://localhost:4096")
+        self.assertEqual(a[a.index("--agent") + 1], "build")
+
+    def test_prepends_instruction_to_prompt(self):
+        captured, fake = self._capture(
+            [json.dumps({"type": "text", "part": {"text": "ok"}})]
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            list(llm.opencode_chat_stream("body", model="m", instruction="Be brief."))
+        self.assertEqual(captured["args"][-1], "Be brief.\n\nbody")
+
+    def test_error_event_raises_runtimeerror(self):
+        lines = [json.dumps({
+            "type": "error",
+            "error": {"name": "APIError", "data": {"message": "rate limited"}},
+        })]
+        captured, fake = self._capture(lines)
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            with self.assertRaises(RuntimeError) as cm:
+                list(llm.opencode_chat_stream("hi", model="m"))
+        self.assertIn("rate limited", str(cm.exception))
+
+    def test_nonzero_exit_raises_runtimeerror_with_stderr(self):
+        captured, fake = self._capture(
+            [], returncode=2, stderr_lines=["boom", "more"],
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            with self.assertRaises(RuntimeError) as cm:
+                list(llm.opencode_chat_stream("hi", model="m"))
+        msg = str(cm.exception)
+        self.assertIn("2", msg)
+        self.assertIn("boom", msg)
+
+    def test_missing_binary_raises_runtimeerror(self):
+        with mock.patch("subprocess.Popen", side_effect=FileNotFoundError):
+            with self.assertRaises(RuntimeError):
+                list(llm.opencode_chat_stream("hi", model="m"))
+
+    def test_empty_prompt_raises_valueerror(self):
+        with self.assertRaises(ValueError):
+            list(llm.opencode_chat_stream("", model="m"))
 
 
 if __name__ == "__main__":

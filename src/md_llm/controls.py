@@ -13,6 +13,11 @@ Three providers, toggled by a radio:
   - **OpenAI-compatible**: a generic OpenAI Chat Completions API. Models AND the
     API key are remembered PER endpoint URL (the ``oai_endpoints`` registry), so
     switching endpoints restores the matching model list + key.
+  - **OpenCode**: the open source coding AGENT, invoked as a subprocess
+    (``opencode run --format json --auto``). No API key (auth is out-of-band
+    via ``opencode auth login`` / env); instead it exposes a working directory,
+    an optional ``--attach`` server URL, and an optional agent. Models come from
+    ``opencode models`` (cached per session with a Refresh button).
 
 The controls are prefix-namespaced (``prefix`` arg) so several panels can each
 keep independent values without their Streamlit widget keys colliding — the chat
@@ -67,6 +72,11 @@ def _current_llm_model(prefix=""):
         if sel and sel != "(other — type below)":
             return sel.strip()
         return st.session_state.get(f"{p}llm_oai_model", "").strip()
+    if provider == "OpenCode":
+        sel = st.session_state.get(f"{p}llm_opencode_model_sel")
+        if sel and sel != "(other — type below)":
+            return sel.strip()
+        return st.session_state.get(f"{p}llm_opencode_model", "").strip()
     sel = st.session_state.get(f"{p}llm_model_sel")
     if sel == "(other — type below)":
         return st.session_state.get(f"{p}llm_model_custom", "").strip()
@@ -279,6 +289,126 @@ def _remember_oai_endpoint(endpoint):
 
 # --- control widgets --------------------------------------------------------
 
+# --- OpenCode (coding agent, subprocess path) -------------------------------
+#
+# OpenCode is not an LLM API — it's an agent CLI (`opencode run`). So its
+# controls look different from the HTTP providers: there's no API key (auth is
+# done out-of-band via `opencode auth login` / env), and there's a working
+# directory the agent operates in. Models come from `opencode models` (cached
+# per session + a Refresh button, since it's a subprocess call).
+
+def _opencode_cached_models():
+    """Return opencode's model list, memoized in session_state per session.
+
+    ``opencode models`` is a subprocess call, so the result is cached in
+    session_state and refreshed on demand via the Refresh button in
+    :func:`_render_opencode_controls`.
+    """
+    cache = st.session_state.get("_opencode_models_cache")
+    if cache is None:
+        cache = llm.list_opencode_models()
+        st.session_state["_opencode_models_cache"] = cache
+    return list(cache)
+
+
+def _remember_opencode_model(model):
+    """Persist ``model`` as the most recently used opencode model on disk."""
+    model = (model or "").strip()
+    if not model:
+        return
+    settings = get_core().load_settings()
+    llm_s = dict(settings.get("llm") or {})
+    existing = [m for m in (llm_s.get("llm_opencode_models") or []) if m != model]
+    llm_s["llm_opencode_models"] = [model] + existing
+    llm_s["llm_opencode_last_model"] = model
+    settings["llm"] = llm_s
+    get_core().save_settings(settings)
+
+
+def _render_opencode_controls(prefix, saved_llm):
+    """Render the OpenCode provider's model / workdir / attach / agent controls.
+
+    Models are merged from ``opencode models`` (cached) and the user's
+    previously-used list. The working directory defaults to a sandbox subdir of
+    the host base dir so the agent's bash/edit tools stay scoped by default;
+    the user can override it to point at a real project.
+    """
+    p = prefix
+    base_dir = get_core().base_dir
+    sandbox_default = os.path.join(base_dir, ".opencode-sandbox")
+
+    discovered = _opencode_cached_models()
+    history = [
+        m for m in (saved_llm.get("llm_opencode_models") or [])
+        if isinstance(m, str) and m
+    ]
+    last_model = saved_llm.get("llm_opencode_last_model", "")
+
+    # Merge history (most-recent-first) + discovered, de-duplicated.
+    merged: list[str] = []
+    for m in list(history) + discovered:
+        if m and m not in merged:
+            merged.append(m)
+    if last_model and last_model not in merged:
+        merged = [last_model] + merged
+
+    options = merged + ["(other — type below)"]
+    sel = st.session_state.get(f"{p}llm_opencode_model_sel")
+    if not sel and last_model and last_model in options:
+        st.session_state[f"{p}llm_opencode_model_sel"] = last_model
+    if sel and sel != "(other — type below)" and sel not in options:
+        options = [sel] + options
+
+    scol1, scol2 = st.columns([4, 1])
+    scol1.selectbox(
+        "Model (provider/model)",
+        options,
+        key=f"{p}llm_opencode_model_sel",
+        help="Models from `opencode models` + your previously-used ones. "
+             "Pick \"(other — type below)\" to type a new one.",
+    )
+    if scol2.button("Refresh", help="Re-run `opencode models` to refresh the list."):
+        st.session_state.pop("_opencode_models_cache", None)
+        st.rerun()
+    if st.session_state.get(f"{p}llm_opencode_model_sel") == "(other — type below)":
+        st.text_input(
+            "Custom model name",
+            value=saved_llm.get(f"{p}llm_opencode_model", ""),
+            key=f"{p}llm_opencode_model",
+            help="e.g. anthropic/claude-sonnet-420, openai/gpt-4o-mini",
+        )
+
+    st.text_input(
+        "Working directory",
+        value=saved_llm.get(f"{p}llm_opencode_workdir", sandbox_default),
+        key=f"{p}llm_opencode_workdir",
+        help="The agent runs bash/read/edit inside this directory. Defaults to "
+             "a sandbox subdir of the host base dir; point it at a project to "
+             "let the agent operate there.",
+    )
+    st.text_input(
+        "Attach to server (optional)",
+        value=saved_llm.get(f"{p}llm_opencode_attach", ""),
+        key=f"{p}llm_opencode_attach",
+        placeholder="e.g. http://localhost:4096",
+        help="Attach to a running `opencode serve` instance to avoid the "
+             "per-message cold start. Leave empty to spawn a fresh `opencode run`.",
+    )
+    st.text_input(
+        "Agent (optional)",
+        value=saved_llm.get(f"{p}llm_opencode_agent", ""),
+        key=f"{p}llm_opencode_agent",
+        help="Restrict to a specific opencode agent (see `opencode agent list`).",
+    )
+    st.caption(
+        "_OpenCode runs as a full agent with `--auto` (tools auto-approved in "
+        "the working directory). Authenticate models out-of-band via "
+        "`opencode auth login` or provider env vars._"
+    )
+
+
+# --- control widgets --------------------------------------------------------
+
 def _on_oai_endpoint_change(prefix):
     """on_change callback for the OpenAI-compatible endpoint selector.
 
@@ -436,7 +566,7 @@ def _render_llm_controls(prefix="", show_instruction=True):
     saved_llm = get_core().load_settings().get("llm") or {}
     provider = st.radio(
         "Provider",
-        ["OpenRouter", "Ollama", "OpenAI-compatible"],
+        ["OpenRouter", "Ollama", "OpenAI-compatible", "OpenCode"],
         horizontal=True,
         key=f"{p}llm_provider",
     )
@@ -459,6 +589,8 @@ def _render_llm_controls(prefix="", show_instruction=True):
             st.text_input("Custom model name", key=f"{p}llm_model_custom")
     elif provider == "OpenAI-compatible":
         _render_oai_controls(prefix, saved_llm)
+    elif provider == "OpenCode":
+        _render_opencode_controls(prefix, saved_llm)
     else:
         st.text_input(
             "OpenRouter endpoint",

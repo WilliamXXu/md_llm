@@ -13,6 +13,39 @@ import os
 from .core import get_core
 
 
+# Proportional content zoom for the Reader and Chat panels. Unlike a flat
+# font-size override (which flattens the heading/body hierarchy — every element
+# becomes the same size), `zoom` scales headings, body text, and code blocks
+# together, so the size differences within a document are preserved exactly and
+# bold/font-weight styling is untouched. Scoped to Streamlit's markdown/code
+# containers (``.stMarkdown`` / ``.stCodeBlock``); chat-message bodies render
+# inside the same containers, so they scale too, while widget labels, buttons,
+# and avatars keep their theme sizes. `zoom` is supported in all modern browsers
+# (Chrome/Edge/Safari always, Firefox ≥ 126). Tunable: change this one number to
+# make content larger (2.0 ≈ the earlier 28px body target) or smaller.
+_CONTENT_ZOOM = 1.2
+
+# Colour + weight for bold text (``**bold**`` / ``<strong>``). A distinct colour
+# makes bold pop against the body — default-weight ``strong`` can look muted once
+# the content is zoomed. Tunable: change this one value to recolour.
+_BOLD_COLOR = "#d62828"
+
+_BODY_FONT_SIZE_CSS = f"""
+<style>
+.stMarkdown, [data-testid="stMarkdownContainer"],
+.stCodeBlock, [data-testid="stCodeBlock"] {{
+  zoom: {_CONTENT_ZOOM};
+}}
+.stMarkdown strong, .stMarkdown b,
+[data-testid="stMarkdownContainer"] strong,
+[data-testid="stMarkdownContainer"] b {{
+  font-weight: 800;
+  color: {_BOLD_COLOR};
+}}
+</style>
+"""
+
+
 def _human_size(nbytes):
     """Format a byte count as e.g. '1.2 KB' / '3.4 MB'."""
     for unit in ("B", "KB", "MB", "GB"):

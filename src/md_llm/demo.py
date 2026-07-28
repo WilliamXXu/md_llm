@@ -2,107 +2,104 @@
 
 Run with::
 
-    streamlit run -m md_llm.demo
+    streamlit run src/md_llm/demo.py
 
-The sidebar holds a directory picker; the two tabs render the md_llm reader and
-chat against any ``.md`` / ``.txt`` file in that directory. This is also the
-integration reference: a host app does the same ``init(Core(...))`` + two
-``st.tabs`` with ``key=TABS_KEY`` then calls ``render_reader()`` / ``render_chat()``.
+The sidebar has a native Streamlit ``st.file_uploader``: clicking it pops up
+the browser's OS-level file dialog (Finder on macOS, Explorer on Windows, …),
+and the chosen ``.md`` / ``.txt`` file is staged for the Reader tab. The chat
+tab talks about whatever is open in the Reader.
+
+Why not ``tkinter.filedialog``? Streamlit runs the script on a worker thread,
+but macOS forbids instantiating ``NSWindow`` off the main thread — so a Tk
+dialog aborts the whole app with ``NSInternalInconsistencyException``.
+``st.file_uploader`` is the supported, cross-platform way to trigger the OS
+file dialog from inside Streamlit: it returns the file's *bytes*, so we
+materialize them into a stable per-user working dir and let the existing
+path-based reader/chat pipeline read them from there.
+
+This file is also the integration reference: a host app does the same
+``init(Core(...))`` + two ``st.tabs`` with ``key=TABS_KEY`` then calls
+``render_reader()`` / ``render_chat()``.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import streamlit as st
 
 import md_llm
 
+# Per-user working dir: uploaded files land in ``uploads/``, saved chats in
+# ``uploads/_chats/`` — mirroring the original demo's per-directory layout but
+# rooted at a stable spot the user can find afterwards. Created lazily.
+_WORK_DIR = Path.home() / ".md_llm"
+_UPLOADS_DIR = _WORK_DIR / "uploads"
+_CHATS_DIR = _UPLOADS_DIR / "_chats"
+_SETTINGS_PATH = _WORK_DIR / "_md_llm_settings.json"
 
-def _list_documents(root):
-    """Collect .md/.txt files under ``root``, top-level files first.
 
-    Returns the list of *relpaths* (relative to ``root``) the selectbox will
-    show. Files directly in ``root`` come first (bare names, sorted); then each
-    subfolder's files are listed in turn, shown as ``subdir/file`` so the nested
-    path is visible in the dropdown. Hidden files/dirs (leading dot) and the
-    chat-save subdir (``_chats``) are skipped. Relpaths are what
-    ``open_in_reader`` stages, so the reader resolves them against ``base_dir``
-    (= ``root``) correctly whether the file is at the top or nested.
+def _ensure_work_dirs():
+    """Create the working directories used by the demo (idempotent)."""
+    _UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    _CHATS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _install_core():
+    """Point md_llm at the working dir.
+
+    The Reader's path-safety guard resolves the staged relpath against
+    ``core.base_dir`` and only opens files inside ``core.markdown_dirs``, so we
+    need a Core registered even before any file is uploaded (otherwise the
+    first render raises). The same Core serves uploaded files: their basename
+    lives directly under ``_UPLOADS_DIR`` (= ``base_dir``).
     """
-    top_level = sorted(
-        name for name in os.listdir(root)
-        if not name.startswith(".")
-        and os.path.isfile(os.path.join(root, name))
-        and name.endswith((".md", ".txt"))
-    )
-
-    nested = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Skip hidden dirs and the chat-save subdir in-place so os.walk doesn't
-        # descend into them.
-        dirnames[:] = sorted(
-            d for d in dirnames if not d.startswith(".") and d != "_chats"
-        )
-        # Only collect from subfolders; the top level is handled above.
-        rel_dir = os.path.relpath(dirpath, root)
-        if rel_dir == ".":
-            continue
-        for name in sorted(filenames):
-            if name.startswith(".") or not name.endswith((".md", ".txt")):
-                continue
-            rel = os.path.join(rel_dir, name)
-            # Normalize for the host OS (so "sub/foo.md" on display everywhere).
-            nested.append(rel.replace(os.sep, "/"))
-
-    return top_level + nested
+    md_llm.init(md_llm.Core(
+        base_dir=str(_UPLOADS_DIR),
+        markdown_dirs=(str(_UPLOADS_DIR),),
+        chat_save_dir=str(_CHATS_DIR),
+        settings_path=str(_SETTINGS_PATH),
+    ))
 
 
 def main():
-    st.set_page_config(page_title="md_llm demo", layout="wide")
+    st.set_page_config(page_title="md_llm demo", layout="wide", page_icon="📖")
+    _ensure_work_dirs()
+    _install_core()
 
     with st.sidebar:
-        st.subheader("Directory")
-        default_dir = os.path.expanduser("~")
-        root = st.text_input("Document directory", value=default_dir)
-        root = os.path.expanduser(root)
-        if not os.path.isdir(root):
-            st.error("Not a directory.")
-            st.stop()
-        files = _list_documents(root)
-        if not files:
-            st.info("No .md / .txt files in this directory.")
-            st.stop()
-        chosen = st.selectbox(
-            "Open in reader", files,
-            on_change=lambda: md_llm.open_in_reader(st.session_state.get("_demo_pick")),
-            key="_demo_pick",
+        st.subheader("Open file")
+        # Native Streamlit picker: clicking the widget opens the browser's
+        # OS-level file dialog. type= restricts the accept filter to .md/.txt
+        # in the dialog itself, so the user can't pick anything else.
+        uploaded = st.file_uploader(
+            "Choose a markdown or text file",
+            type=["md", "txt"],
+            label_visibility="collapsed",
+            help="Opens your OS file dialog. The file is read into a local "
+                 "working directory so the Reader can open it.",
         )
-        # Initial open (without a change event) on first load.
-        if "_reader_target" not in st.session_state and chosen:
-            md_llm.open_in_reader(chosen)
+        if uploaded is not None:
+            # Materialize the upload to disk: the Reader/chat pipeline is
+            # path-based (it resolves relpaths against core.base_dir), so we
+            # need a real file there. Same-name uploads overwrite, which is
+            # the least-surprising behavior for re-picking a file.
+            dest = _UPLOADS_DIR / uploaded.name
+            try:
+                with open(dest, "wb") as f:
+                    f.write(uploaded.getvalue())
+            except OSError as e:
+                st.error(f"Could not stage file: {e}")
+                st.stop()
+            md_llm.open_in_reader(uploaded.name)
+            st.caption(f"Open: `{uploaded.name}`")
+        elif st.session_state.get("_reader_target"):
+            st.caption(f"Open: `{st.session_state['_reader_target']}`")
         st.caption(
-            "Saved chats go to a `_chats/` subdirectory of the chosen dir. "
-            "Settings persist to `_md_llm_settings.json` there too."
+            f"Uploads staged at `{_UPLOADS_DIR}`. Saved chats go to "
+            f"`{_CHATS_DIR}`."
         )
-
-    # Re-inject the host's facts whenever the directory changes. init() itself
-    # is idempotent (just overwrites the registered core), but it is NOT called
-    # again after the first run, so without this block the Core would keep
-    # pointing at the first directory ever picked — and every staged relpath
-    # would be resolved against that stale base_dir, so files from a newly
-    # chosen directory would silently fail to open.
-    if st.session_state.get("_demo_core_root") != root:
-        md_llm.init(md_llm.Core(
-            base_dir=root,
-            markdown_dirs=(root,),
-            chat_save_dir=os.path.join(root, "_chats"),
-            settings_path=os.path.join(root, "_md_llm_settings.json"),
-        ))
-        # Drop any file staged against the old directory: its relpath is now
-        # ambiguous (a same-named file may exist in the new dir) or stale.
-        st.session_state.pop("_reader_target", None)
-        st.session_state["_demo_core_root"] = root
 
     tabs = st.tabs(
         [md_llm.READER_TAB_LABEL, md_llm.CHAT_TAB_LABEL],

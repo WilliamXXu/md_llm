@@ -1,19 +1,25 @@
 """Lightweight LLM clients for post-processing transcripts (summarize, etc.).
 
-Three providers are supported:
+Four providers are supported:
   - Ollama: a local server reachable over HTTP (default).
   - OpenRouter: a hosted API keyed by OPENROUTER_API_KEY.
   - OpenAI: a generic OpenAI-compatible API keyed by OPENAI_API_KEY. Point
     its endpoint at any OpenAI-compatible host (OpenAI itself, Groq, Together,
     ...) and type a model name. Speaks the same /chat/completions wire format
     as OpenRouter, minus OpenRouter's attribution headers.
+  - OpenCode: the open source coding AGENT, invoked as a subprocess
+    (`opencode run --format json --auto`). Not a plain chat API — with --auto it
+    can run tools (bash/read/edit/...) in a working directory. Auth + model
+    routing are OpenCode's own; the chat panel streams its JSONL event output.
 
-Uses only the standard library (urllib + json) to match the no-extra-deps
-style of transcribe_local.py's remote-Whisper client.
+Uses only the standard library (urllib + json + subprocess) to match the
+no-extra-deps style of transcribe_local.py's remote-Whisper client.
 """
 
 import os
 import json
+import subprocess
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -48,6 +54,14 @@ OPENROUTER_DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 # Ollama's /api/tags discovery, so there is no auto-populated dropdown.
 OPENAI_DEFAULT_ENDPOINT = "https://api.openai.com/v1"
 OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
+
+# OpenCode (the open source coding agent) defaults. Unlike the providers above,
+# OpenCode is not an LLM API — it's an agent CLI invoked as a subprocess
+# (`opencode run --format json --auto`). Auth + model routing are OpenCode's
+# own (configure via `opencode auth login` / env). Model ids are
+# `provider/model`, discoverable via `opencode models`.
+OPENCODE_BIN = "opencode"
+OPENCODE_DEFAULT_MODEL = ""
 
 
 def _join_url(endpoint, path):
@@ -783,3 +797,183 @@ def openai_generate(
             err_msg = err.get("message") if isinstance(err, dict) else str(err)
             raise RuntimeError(f"OpenAI error: {err_msg}")
     return ""
+
+
+# ---------------------------------------------------------------------------
+# OpenCode (coding agent, subprocess path)
+# ---------------------------------------------------------------------------
+#
+# `opencode run --format json --auto` emits one JSON object per line (JSONL) on
+# stdout. Each line has a ``type`` field:
+#   - "text"        → part.text is a piece of the assistant's reply (yield it)
+#   - "tool_use"    → a tool finished (part.tool, part.state.title); surfaced
+#                     inline as a one-line marker so the user sees agent activity
+#   - "step_start" / "step_finish" → step boundaries (ignored here)
+#   - "error"       → part.error.data.message; raised as RuntimeError
+# A non-zero process exit (with no prior error event) is also raised, using the
+# collected stderr. Note: token-level streaming is NOT available on this path —
+# text arrives per OpenCode text-part, which still streams progressively across
+# agent steps.
+
+
+def list_opencode_models(binary=OPENCODE_BIN, timeout=20):
+    """Return model ids advertised by ``opencode models`` (``provider/model``).
+
+    Returns an empty list on any failure (binary missing, non-zero exit, parse
+    error) so a UI selectbox degrades gracefully to manual entry — mirrors
+    :func:`list_ollama_models`.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "models"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return []
+    if proc.returncode != 0:
+        return []
+    models = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # `opencode models` prints a table; the model id is the first
+        # whitespace-delimited token and always contains a "/" (provider/model).
+        first = line.split()[0]
+        if "/" in first:
+            models.append(first)
+    return models
+
+
+def opencode_chat_stream(
+    prompt,
+    *,
+    model=None,
+    workdir=None,
+    attach=None,
+    agent=None,
+    binary=OPENCODE_BIN,
+    instruction=None,
+    timeout=REQUEST_TIMEOUT,
+):
+    """Run ``opencode run --format json --auto`` and stream assistant text.
+
+    OpenCode is a coding AGENT, not a plain chat API: with ``--auto`` it may run
+    bash/read/edit/etc. in ``workdir``. The JSONL event stream is parsed line by
+    line; ``text`` events are yielded as assistant chunks, ``tool_use`` events
+    are surfaced inline as a one-line marker, and an ``error`` event (or a
+    non-zero exit) raises :class:`RuntimeError`. If ``instruction`` is given it
+    is prepended to the prompt.
+
+    Auth + model routing are OpenCode's own (configure via ``opencode auth
+    login`` / env). Token-level streaming is unavailable on this path; text
+    arrives per OpenCode text-part, which still streams progressively across
+    agent steps. Very large prompts may hit the OS argv length limit (consider
+    ``--attach`` to a running server with file context for huge documents).
+
+    Raises :class:`RuntimeError` with a clear message on a missing binary /
+    server / agent failure so the UI can surface it via ``st.error``.
+    """
+    if not prompt:
+        raise ValueError("No prompt for opencode run.")
+
+    full_prompt = prompt
+    if instruction:
+        full_prompt = f"{instruction}\n\n{prompt}"
+
+    args = [binary, "run", "--format", "json", "--auto"]
+    if model:
+        args += ["--model", model]
+    if workdir:
+        args += ["--dir", workdir]
+    if attach:
+        args += ["--attach", attach]
+    if agent:
+        args += ["--agent", agent]
+    args.append(full_prompt)
+
+    # opencode's --dir does a chdir, so the directory must already exist.
+    # Create it (best-effort) — this also gives a fresh sandbox a place to land.
+    if workdir:
+        try:
+            os.makedirs(workdir, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(
+                f"Could not create opencode working directory {workdir!r}: {e}"
+            ) from e
+
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # line-buffered so yielded lines arrive as produced
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"Could not find the {binary!r} executable on PATH. Install "
+            "opencode (see https://opencode.ai) to use this provider."
+        ) from e
+    except OSError as e:
+        raise RuntimeError(f"Could not start opencode: {e}") from e
+
+    # Drain stderr on a background thread so a chatty agent can't fill the OS
+    # pipe buffer (64 KiB) and deadlock the stdout reader.
+    stderr_lines: list[str] = []
+
+    def _drain_stderr():
+        if proc.stderr is not None:
+            for ln in proc.stderr:
+                stderr_lines.append(ln)
+
+    drainer = threading.Thread(target=_drain_stderr, daemon=True)
+    drainer.start()
+
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(evt, dict):
+                continue
+            etype = evt.get("type")
+            if etype == "text":
+                part = evt.get("part") or {}
+                piece = part.get("text") or ""
+                if piece:
+                    yield piece
+            elif etype == "tool_use":
+                part = evt.get("part") or {}
+                tool = part.get("tool") or "tool"
+                state = part.get("state") or {}
+                title = (state.get("title") or "").strip()
+                label = f" — {title}" if title else ""
+                yield f"\n\n_🔧 {tool}{label}_\n\n"
+            elif etype == "error":
+                err = evt.get("error") or {}
+                data = err.get("data") or {}
+                msg = (
+                    data.get("message")
+                    or err.get("name")
+                    or "opencode error"
+                )
+                raise RuntimeError(f"opencode error: {msg}")
+        proc.wait(timeout=timeout)
+    finally:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        drainer.join(timeout=5)
+
+    if proc.returncode not in (0, None):
+        stderr_text = "".join(stderr_lines).strip()
+        raise RuntimeError(
+            f"opencode run exited {proc.returncode}: {stderr_text[-500:]}"
+        )

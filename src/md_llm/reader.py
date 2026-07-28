@@ -26,7 +26,12 @@ import streamlit.components.v1 as components
 from . import llm as _llm
 from .controls import _current_llm_model
 from .core import get_core
-from .state import _display_name_for_filepath, _human_size, _read_text
+from .state import (
+    _BODY_FONT_SIZE_CSS,
+    _display_name_for_filepath,
+    _human_size,
+    _read_text,
+)
 
 # Session-state key holding the reader target (a relpath against core.base_dir).
 _READER_TARGET = "_reader_target"
@@ -197,9 +202,18 @@ def render_reader():
     with col_clear:
         st.button("Clear", on_click=_close_reader)
 
+    # Permanently bump body-text + code font size. Scoped to Streamlit's
+    # markdown/code containers so widget labels, buttons, and headers keep their
+    # default sizes; chat-message bodies use the same containers, so the chat
+    # panel is covered too.
+    st.markdown(_BODY_FONT_SIZE_CSS, unsafe_allow_html=True)
+
     # .md is authored content → render as markdown; anything else → code block.
+    # unsafe_allow_html lets HTML inline markup like <b>bold</b> / <strong>…
+    # render alongside standard **bold** markdown — without it Streamlit strips
+    # the tags and shows their inner text unstyled.
     if target.endswith(".md"):
-        st.markdown(text)
+        st.markdown(text, unsafe_allow_html=True)
     else:
         st.code(text, language="text")
 
