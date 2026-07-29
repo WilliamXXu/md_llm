@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 from datetime import datetime, timezone
 
 import streamlit as st
@@ -46,6 +48,10 @@ from .state import (
 
 # Session-state keys (session-memory only — nothing persisted except via Save).
 _CHAT_MESSAGES = "_chat_messages"  # list[{"role","content"}]
+# Dict describing the in-flight background stream (see _stream_worker): the LLM
+# call runs in a daemon thread so it survives tab switches — esp. OpenCode's
+# subprocess, whose generator kills the process on close. Keys: text/done/error/source.
+_CHAT_BG_TASK = "_chat_bg_task"
 
 # A passage staged in the Reader ("Send to chat") to attach to the NEXT chat
 # question. Read here by literal string (matches reader.py) rather than imported
@@ -393,6 +399,34 @@ def _build_stream(context_path, holder):
     return _safe_stream(gen, holder), None
 
 
+def _stream_worker(task, stream, holder):
+    """Consume ``stream`` in a background thread, accumulating text into ``task``.
+
+    Detached from Streamlit's render loop so the LLM call keeps running when the
+    user switches tabs. This matters most for the OpenCode provider:
+    ``opencode_chat_stream`` drives a subprocess and kills it in its generator's
+    ``finally``; and ``st.write_stream`` is cancelled by the rerun a tab switch
+    triggers, which would close the generator and terminate the agent. Iterating
+    here keeps the subprocess alive to completion.
+
+    The chat panel reads ``task`` (``text``/``done``/``error``) on each render
+    for live display and finalizes once when ``done`` is set. Must not call any
+    ``st.*`` API (not thread-safe).
+    """
+    buf: list[str] = []
+    try:
+        for chunk in stream:
+            if chunk:
+                buf.append(chunk)
+                task["text"] = "".join(buf)
+    except Exception as e:  # noqa: BLE001 — surface any provider error
+        task["error"] = str(e)
+    if not task.get("error") and holder.get("error"):
+        task["error"] = holder["error"]
+    task["text"] = (task.get("text") or "").strip()
+    task["done"] = True
+
+
 def render_chat():
     """Render the LLM chat panel: controls, the chat UI, and the streaming reply.
 
@@ -473,6 +507,7 @@ def render_chat():
             st.rerun()
     if col_clear.button("Clear conversation", help="Reset the chat history."):
         st.session_state.pop(_CHAT_MESSAGES, None)
+        st.session_state.pop(_CHAT_BG_TASK, None)
         st.rerun()
 
     st.divider()
@@ -492,6 +527,47 @@ def render_chat():
     if err:
         with st.chat_message("assistant"):
             st.error(f"LLM call failed: {err}")
+
+    # --- Background streaming task (survives tab switches) -------------
+    # The LLM call runs in a daemon thread (_stream_worker), so switching to
+    # the Reader mid-reply no longer cancels it — the call (and OpenCode's
+    # subprocess) keeps running at the back end. Here we finalize once when
+    # done, and otherwise stream the partial reply + poll.
+    task = st.session_state.get(_CHAT_BG_TASK)
+    if task:
+        if task.get("done"):
+            if task.get("error"):
+                st.session_state["_chat_last_error"] = task["error"]
+                log_event(f"Chat failed: {task['error']}", level="error",
+                          source=task.get("source", ""))
+            else:
+                reply_text = (task.get("text") or "").strip()
+                st.session_state.setdefault(_CHAT_MESSAGES, []).append({
+                    "role": "assistant",
+                    "content": reply_text
+                    or "_(empty response — nothing came back.)_",
+                })
+                if reply_text:
+                    log_event(f"Chat reply ({len(reply_text)} chars)",
+                              level="info", source=task.get("source", ""))
+                else:
+                    log_event("Chat reply empty — nothing came back.",
+                              level="warn", source=task.get("source", ""))
+            st.session_state.pop(_CHAT_BG_TASK, None)
+            st.rerun()
+        # Still running: show the partial reply and poll. The work continues in
+        # the background thread regardless of which tab is active.
+        with st.chat_message("assistant"):
+            body = task.get("text") or ""
+            if body:
+                st.markdown(body + " ▌")
+            else:
+                st.caption(
+                    "_working… (running in the background — switching tabs is "
+                    "safe; the reply will appear here)_"
+                )
+        time.sleep(0.4)
+        st.rerun()
 
     # --- Input ---------------------------------------------------------
     prompt = st.chat_input("Ask about this document…")
@@ -514,31 +590,16 @@ def render_chat():
             st.session_state["_chat_last_error"] = verr
             log_event(f"Chat failed: {verr}", level="error", source=chat_src)
         else:
-            with st.chat_message("user"):
-                st.markdown(prompt)
-            with st.chat_message("assistant"):
-                reply = st.write_stream(stream)
-            if holder.get("error"):
-                st.session_state["_chat_last_error"] = holder["error"]
-                log_event(
-                    f"Chat failed: {holder['error']}",
-                    level="error", source=chat_src,
-                )
-            else:
-                reply_text = (reply or "").strip()
-                if reply_text:
-                    log_event(
-                        f"Chat reply ({len(reply_text)} chars)",
-                        level="info", source=chat_src,
-                    )
-                else:
-                    log_event(
-                        "Chat reply empty — nothing came back.",
-                        level="warn", source=chat_src,
-                    )
-                msgs.append({
-                    "role": "assistant",
-                    "content": reply_text
-                    or "_(empty response — nothing came back.)",
-                })
+            # Hand the stream to a background thread so the call (and any
+            # subprocess it drives, e.g. `opencode run`) keeps running when the
+            # user switches tabs. st.write_stream would be cancelled by the
+            # tab-switch rerun, and the stream's generator kills its subprocess
+            # on close. The poll block above drains `task` for live display.
+            task = {"text": "", "done": False, "error": None, "source": chat_src}
+            worker = threading.Thread(
+                target=_stream_worker, args=(task, stream, holder),
+                daemon=True,
+            )
+            st.session_state[_CHAT_BG_TASK] = task
+            worker.start()
         st.rerun()
