@@ -325,6 +325,22 @@ def _remember_opencode_model(model):
     get_core().save_settings(settings)
 
 
+def _current_opencode_variant(prefix=""):
+    """Return the resolved opencode model variant, or None to omit ``--variant``.
+
+    ``prefix`` selects which set of widget keys to read. Returns the custom
+    value when "(other — type below)" is selected, the dropdown selection when a
+    concrete variant is picked, and None for "(none)" / unset.
+    """
+    p = prefix
+    sel = st.session_state.get(f"{p}llm_opencode_variant_sel")
+    if sel == "(other — type below)":
+        return (st.session_state.get(f"{p}llm_opencode_variant") or "").strip() or None
+    if sel and sel != "(none)":
+        return sel
+    return None
+
+
 def _render_opencode_controls(prefix, saved_llm):
     """Render the OpenCode provider's model / workdir / attach / agent controls.
 
@@ -376,6 +392,23 @@ def _render_opencode_controls(prefix, saved_llm):
             value=saved_llm.get(f"{p}llm_opencode_model", ""),
             key=f"{p}llm_opencode_model",
             help="e.g. anthropic/claude-sonnet-420, openai/gpt-4o-mini",
+        )
+
+    variant_options = ["(none)"] + list(llm.OPENCODE_VARIANTS) + ["(other — type below)"]
+    st.selectbox(
+        "Model variant",
+        variant_options,
+        key=f"{p}llm_opencode_variant_sel",
+        help="Provider-specific reasoning effort, forwarded to "
+             "`opencode run --variant`. Pick \"(none)\" to omit it; supported "
+             "values depend on the model's provider (e.g. high, max, minimal).",
+    )
+    if st.session_state.get(f"{p}llm_opencode_variant_sel") == "(other — type below)":
+        st.text_input(
+            "Custom variant",
+            value=saved_llm.get(f"{p}llm_opencode_variant", ""),
+            key=f"{p}llm_opencode_variant",
+            help="e.g. high, max, minimal (provider-specific).",
         )
 
     st.text_input(
@@ -566,7 +599,7 @@ def _render_llm_controls(prefix="", show_instruction=True):
     saved_llm = get_core().load_settings().get("llm") or {}
     provider = st.radio(
         "Provider",
-        ["OpenRouter", "Ollama", "OpenAI-compatible", "OpenCode"],
+        ["OpenCode", "OpenRouter", "Ollama", "OpenAI-compatible"],
         horizontal=True,
         key=f"{p}llm_provider",
     )

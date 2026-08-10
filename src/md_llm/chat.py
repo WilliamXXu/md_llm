@@ -32,6 +32,7 @@ from .console import log_event
 from .controls import (
     _current_llm_model,
     _current_oai_endpoint,
+    _current_opencode_variant,
     _oai_registry_entry,
     _remember_oai_endpoint,
     _remember_opencode_model,
@@ -382,12 +383,13 @@ def _build_stream(context_path, holder):
         workdir = (st.session_state.get(f"{p}llm_opencode_workdir") or "").strip() or None
         attach = (st.session_state.get(f"{p}llm_opencode_attach") or "").strip() or None
         agent = (st.session_state.get(f"{p}llm_opencode_agent") or "").strip() or None
+        variant = _current_opencode_variant(p)
         # Persist the chosen model so it reappears next session.
         _remember_opencode_model(model)
         prompt = _turns_to_opencode_prompt(turns)
         gen = llm.opencode_chat_stream(
             prompt, model=model, workdir=workdir, attach=attach,
-            agent=agent, instruction=instruction,
+            agent=agent, variant=variant, instruction=instruction,
         )
     else:
         endpoint = st.session_state.get(
@@ -427,6 +429,71 @@ def _stream_worker(task, stream, holder):
     task["done"] = True
 
 
+# ---------------------------------------------------------------------------
+# Control continuity across view switches
+# ---------------------------------------------------------------------------
+#
+# Streamlit drops a widget's value from session_state once that widget is no
+# longer rendered on a run. A host need not mount both panels at once: the
+# standalone demo renders only the active view (sidebar buttons + an
+# ``if/else``), and a host app may do the same. So going LLM chat -> Reader ->
+# LLM chat would otherwise reset every ``chat_*`` control (provider, model,
+# endpoint, API key, autossh fields) to its default.
+#
+# Fix: mirror the chat panel's widget values into an ordinary (non-widget)
+# session_state key. Non-widget keys are NOT pruned, so the snapshot survives
+# Reader-view runs. It's taken at the end of every chat render (always current
+# as of the last chat-view run, which is when any edit happens) and seeded back
+# before the controls mount so the widgets pick up the prior values instead of
+# their defaults. Session-memory only — nothing hits disk, so the OpenRouter
+# key stays write-only and no new secret is persisted.
+
+_PANEL_SNAPSHOT_KEY = "_chat_controls_snapshot"
+
+
+def _chat_control_keys():
+    """Yield the chat panel's widget-bound session_state keys.
+
+    Covers the ``chat_llm_*`` controls (provider/model/endpoint/key) and the
+    ``_chat_ssh_*`` autossh fields. Internal non-widget keys (``_chat_messages``,
+    ``_chat_bg_task``, the tracked ``_chat_autossh_proc`` Popen, button keys)
+    are intentionally excluded — they're either already non-prunable or hold
+    objects that must not be snapshotted.
+    """
+    for k in st.session_state:
+        if k.startswith("chat_") or k.startswith("_chat_ssh_"):
+            yield k
+
+
+def _snapshot_chat_controls():
+    """Copy the chat panel's current widget values into a non-widget key.
+
+    Called at the end of every chat render so the snapshot always reflects the
+    latest selections the user made (each edit triggers a chat-view rerun, which
+    re-runs this). The mirrored dict lives under a non-widget key, so it
+    survives runs where the chat panel is not rendered.
+    """
+    snap = {k: st.session_state[k] for k in _chat_control_keys()}
+    if snap:
+        st.session_state[_PANEL_SNAPSHOT_KEY] = snap
+
+
+def _restore_chat_controls():
+    """Seed chat panel widget keys from the snapshot when they're absent.
+
+    Runs before the controls mount so each widget picks up its prior value
+    instead of its default. Only fills keys missing from session_state — a
+    value already set this run (e.g. by an on_change callback or the pending-
+    selection block below) is left untouched.
+    """
+    snap = st.session_state.get(_PANEL_SNAPSHOT_KEY)
+    if not snap:
+        return
+    for k, v in snap.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
 def render_chat():
     """Render the LLM chat panel: controls, the chat UI, and the streaming reply.
 
@@ -434,6 +501,12 @@ def render_chat():
     there, then ask about it here. There is no separate dropdown.
     """
     st.subheader("LLM chat")
+
+    # Restore the chat panel's controls from the in-memory snapshot before any
+    # widget mounts, so a Reader -> chat round-trip keeps the user's provider /
+    # model / endpoint / key selections (Streamlit otherwise prunes unmounted
+    # widget state). No-op on the first render and when the chat view never left.
+    _restore_chat_controls()
 
     # Apply pending selections from prior chat interactions, but only if the
     # endpoint hasn't changed (API keys are paired per endpoint).
@@ -493,6 +566,10 @@ def render_chat():
                 prefix="chat_", default=DEFAULT_LLM_AUTOSSH,
                 title="Remote tunnel to Ollama (autossh)",
             )
+    # Snapshot the control values now that every chat_* / _chat_ssh_* widget has
+    # mounted with its current value. The mirrored dict lives under a non-widget
+    # key, so it survives the Reader-view runs that prune the widget keys.
+    _snapshot_chat_controls()
 
     col_save, col_clear, _ = st.columns([1, 1, 2])
     if col_save.button(

@@ -6,6 +6,7 @@ Public API:
 
     md_llm.init(md_llm.Core(base_dir=..., markdown_dirs=(...,), chat_save_dir=...))
     md_llm.render_reader()          # call inside a Streamlit tab/container
+    md_llm.render_toc()             # clickable TOC for the open doc (sidebar)
     md_llm.render_chat()
     md_llm.open_in_reader(relpath)  # stage a document for the Reader + jump to it
 
@@ -21,6 +22,7 @@ from .reader import (
     TABS_KEY,
     open_in_reader,
     render_reader,
+    render_toc,
 )
 from .chat import render_chat
 
@@ -29,6 +31,7 @@ __all__ = [
     "init",
     "get_core",
     "render_reader",
+    "render_toc",
     "render_chat",
     "open_in_reader",
     "TABS_KEY",

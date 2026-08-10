@@ -12,7 +12,8 @@ Four LLM providers (stdlib-only clients, no SDK):
 - **OpenCode** — the open source coding **agent**, invoked via
   `opencode run --format json --auto` (subprocess, full agent with tools).
   Auth/model routing are OpenCode's own; the panel exposes a working directory,
-  an optional `--attach` server URL, and an optional agent. Models come from
+  an optional `--attach` server URL, an optional agent, and an optional
+  provider-specific model variant (`--variant`). Models come from
   `opencode models`.
 
 ## Install
@@ -54,6 +55,21 @@ with tabs[1]:
     md_llm.render_chat()
 ```
 
+### Optional: table of contents in a left-side panel
+
+`render_toc()` renders a click-expandable table of contents for the document
+open in the Reader (parsed from its ATX headings into a heading tree). Only
+top-level sections are shown; clicking one expands it to reveal its
+subsections (a second click folds it back) while jumping the Reader to that
+section — switching to the Reader tab first if needed. Documents with a single
+top-level heading (a title) start expanded so their sections are visible:
+
+```python
+with st.sidebar:
+    ...
+    md_llm.render_toc()   # no-op while nothing / a non-.md file is open
+```
+
 ### Optional: forward md_llm events into a host console
 
 ```python
@@ -83,14 +99,14 @@ dict on disk; the OpenAI-compatible endpoint/model/key registry lives under the
 
 ```
 src/md_llm/
-├── __init__.py   # public API: Core, init, render_reader, render_chat, open_in_reader, TABS_KEY, *_TAB_LABEL
+├── __init__.py   # public API: Core, init, render_reader, render_toc, render_chat, open_in_reader, TABS_KEY, *_TAB_LABEL
 ├── core.py       # Core dataclass + init/get_core (dependency-injected host config)
 ├── llm.py        # stdlib-only LLM clients (Ollama / OpenRouter / OpenAI-compatible / OpenCode)
 ├── state.py      # generic helpers: _read_text, _human_size, _display_name_for_filepath
 ├── console.py    # log_event + set_logger hook (forwards to host console)
 ├── controls.py   # provider/model/endpoint widgets + per-endpoint OAI registry
 ├── autossh.py    # optional remote Ollama SSH tunnel panel
-├── reader.py     # render_reader — markdown/text viewer + quote-to-chat
+├── reader.py     # render_reader + render_toc — markdown/text viewer, clickable TOC, quote-to-chat
 ├── chat.py       # render_chat — streaming multi-turn chat
 └── demo.py       # standalone Streamlit entry point
 ```

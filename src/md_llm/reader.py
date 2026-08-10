@@ -18,7 +18,9 @@ Shared session-state keys (the integration contract the host honors):
 from __future__ import annotations
 
 import base64
+import json
 import os
+import re
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -40,6 +42,88 @@ _READER_TARGET = "_reader_target"
 # string literal (the chat panel reads "_reader_quote" too) rather than an
 # import, to keep reader↔chat decoupled.
 _READER_QUOTE = "_reader_quote"
+
+# A heading the sidebar table of contents wants to jump to, staged as the
+# DOM-matching signature "H<level>|<normalized title>" (see _inject_toc_jump).
+_TOC_JUMP = "_reader_toc_jump"
+
+# Collapsible ToC expansion state: (open target relpath, set of open node ids).
+# Stored alongside the target so switching documents resets the tree.
+_TOC_OPEN = "_reader_toc_open"
+_TOC_OPEN_CTX = "_reader_toc_open_ctx"
+
+# CSS that turns the flat ToC button list into a hierarchy: level-1 rows read
+# as section headers (bold + accent bar), deeper rows step inward as a tree
+# gutter. Keyed rows are `_reader_toc_l<level>_<i>` and levels > 5 share the
+# l5 depth so the panel never collapses.
+_TOC_CSS = """
+[class*="st-key-_reader_toc_l1"] button {
+    font-weight: 700;
+    border-left: 3px solid rgb(214, 40, 40);
+}
+[class*="st-key-_reader_toc_l1"] button > div { padding-left: 0.45rem; }
+[class*="st-key-_reader_toc_l2"] button { margin-left: 0.7rem; }
+[class*="st-key-_reader_toc_l3"] button { margin-left: 1.4rem; }
+[class*="st-key-_reader_toc_l4"] button { margin-left: 2.1rem; }
+[class*="st-key-_reader_toc_l5"] button { margin-left: 2.1rem; }
+[class*="st-key-_reader_toc_l2"] button,
+[class*="st-key-_reader_toc_l3"] button,
+[class*="st-key-_reader_toc_l4"] button,
+[class*="st-key-_reader_toc_l5"] button {
+    border: 1px solid transparent;
+    border-left: 2px solid rgba(49, 51, 63, 0.16);
+}
+[class*="st-key-_reader_toc_l3"] button,
+[class*="st-key-_reader_toc_l4"] button,
+[class*="st-key-_reader_toc_l5"] button { font-size: 0.93em; }
+"""
+
+
+def _toc_row_key(level, index):
+    """Stable sidebar-ToC button key: encodes the heading level for tree CSS."""
+    return f"_reader_toc_l{min(level, 5)}_{index}"
+
+
+def _toc_depths(entries):
+    """Map each entry's markdown level to a tree depth, re-rooted at the
+    document's topmost level (so a doc whose body starts at ``##`` still gets
+    real section headers). Not capped: nesting is decided by the full relative
+    depth (row keys apply the visual depth cap separately)."""
+    if not entries:
+        return []
+    base = min(level for level, _ in entries)
+    return [level - base + 1 for level, _ in entries]
+
+
+def _toc_tree(entries):
+    """Build the heading tree from flat ``(level, title)`` entries.
+
+    Each node is ``{"id", "depth", "level", "title", "children": [...]}``
+    where ``id`` is the entry's index (stable across reruns, so it can key
+    the open/closed state) and ``children`` are the nodes nested directly
+    beneath it. Returns the list of top-level roots.
+    """
+    depths = _toc_depths(entries)
+    roots, stack = [], []
+    for i, ((level, title), depth) in enumerate(zip(entries, depths)):
+        node = {"id": i, "depth": depth, "level": level, "title": title, "children": []}
+        while stack and stack[-1]["depth"] >= depth:
+            stack.pop()
+        if stack:
+            stack[-1]["children"].append(node)
+        else:
+            roots.append(node)
+        stack.append(node)
+    return roots
+
+
+def _toc_auto_open(roots):
+    """ids to start expanded on a fresh document: the single root when the
+    document has exactly one top-level heading (usually the title), so its
+    sections are visible without an extra click. Empty for multi-root docs."""
+    if len(roots) == 1:
+        return {roots[0]["id"]}
+    return set()
 
 # The text_area widget key for the quote box (Reader-internal).
 _READER_QUOTE_AREA = "_reader_quote_area"
@@ -81,6 +165,53 @@ def _resolve_reader_target(rel):
         st.error("Refusing to open a path outside the configured document dirs.")
         return None
     return target
+
+
+# Markdown constructs stripped when converting a heading line to its plain
+# display text / DOM-matching signature (order matters: links first, then tags,
+# then span markers).
+_MD_AUTOLINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_HTML_TAG = re.compile(r"<[^>]+>")
+_MD_SPAN_MARK = re.compile(r"[`*_~]")
+
+
+def _normalize_heading(raw):
+    """Markdown heading text -> plain text for display + DOM matching.
+
+    ``**bold**``, ```code```, ``[link](url)``, ``<b>x</b>`` all collapse to
+    their visible text, and whitespace runs collapse to single spaces — the
+    same normalization the jump script applies on the rendered DOM side.
+    """
+    s = _MD_AUTOLINK.sub(r"\1", raw)
+    s = _HTML_TAG.sub("", s)
+    s = _MD_SPAN_MARK.sub("", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _toc_entries(text):
+    """Parse ATX headings (``#``..``######``) out of markdown text.
+
+    Fenced code blocks are skipped, so a ``# fake heading`` inside a ``` … ```
+    block is not treated as a heading. Returns ``[(level, title)]`` where
+    level is 1..6 and title is the ``_normalize_heading``-ed plain text
+    (trailing closing ``#``s of Setext-style lines are stripped).
+    """
+    entries = []
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if not m:
+            continue
+        title = _normalize_heading(re.sub(r"\s+#+\s*$", "", m.group(2)).strip())
+        if title:
+            entries.append((len(m.group(1)), title))
+    return entries
 
 
 def _copy_text_button(text, label="Copy"):
@@ -144,6 +275,157 @@ def _copy_text_button(text, label="Copy"):
         </script>
         """,
         height=48,
+    )
+
+
+def render_toc():
+    """Click-expandable table of contents for the document open in the Reader.
+
+    Meant for a host's left-side panel / sidebar, rendered next to the Reader.
+    Parses the opened markdown's ATX headings into a tree; only the top-level
+    headings are shown, and clicking one reveals its children (and jumps the
+    Reader there) — a second click folds it back up. A document with a single
+    top-level heading (a title) starts expanded so its sections are visible.
+    Deeper rows step inward under their parent; clicking a leaf jumps to it.
+    Clicking any row also switches to the Reader tab if another view is active.
+    No-op for text files (no headings) and when nothing is open.
+    """
+    rel = st.session_state.get(_READER_TARGET)
+    target = _resolve_reader_target(rel)
+    if not target or not target.endswith(".md"):
+        return
+
+    with st.container(key="_reader_toc_area"):
+        st.subheader("Contents")
+        st.markdown(f"<style>{_TOC_CSS}</style>", unsafe_allow_html=True)
+        entries = _toc_entries(_read_text(target))
+        if not entries:
+            st.caption("_No headings in this document._")
+            return
+        # A pathological doc with thousands of headings would flood the panel.
+        entries = entries[:200]
+        roots = _toc_tree(entries)
+
+        # Expansion state is tied to the open document: switching files drops it
+        # and starts a fresh tree (single-root docs get their root pre-opened).
+        ctx = st.session_state.get(_TOC_OPEN_CTX)
+        if ctx and ctx[0] == target:
+            open_ids = ctx[1]
+        else:
+            open_ids = set()
+            st.session_state[_TOC_OPEN_CTX] = (target, open_ids)
+        if not open_ids:
+            open_ids.update(_toc_auto_open(roots))
+
+        _render_toc_nodes(roots, open_ids)
+
+
+def _render_toc_nodes(nodes, open_ids):
+    """Recursively render a ToC row per node; expanded parents render their
+    children (each click also jumps the Reader to the node's heading)."""
+    for node in nodes:
+        node_id = node["id"]
+        has_children = bool(node["children"])
+        opened = node_id in open_ids
+        caret = ("▾ " if opened else "▸ ") if has_children else ""
+        title = node["title"]
+        if st.button(
+            f"{caret}{title}",
+            key=_toc_row_key(node["depth"], node_id),
+            use_container_width=True,
+            help=f"Jump to “{title}”",
+        ):
+            if has_children:
+                if opened:
+                    open_ids.discard(node_id)
+                else:
+                    open_ids.add(node_id)
+            # Raw markdown level in the signature: the jump script matches
+            # the rendered DOM's actual heading element (h3 stays h3).
+            st.session_state[_TOC_JUMP] = f"H{node['level']}|{title}"
+            st.session_state[TABS_KEY] = READER_TAB_LABEL
+            st.rerun()
+        if has_children and opened:
+            _render_toc_nodes(node["children"], open_ids)
+
+
+def _inject_toc_jump(sig):
+    """Scroll the rendered document to the heading described by ``sig``.
+
+    The Reader's content is plain render-only DOM — Streamlit knows nothing
+    about the headings inside it — so a tiny same-origin iframe script (the
+    same escape hatch ``demo._preserve_reader_scroll`` uses) finds the heading
+    element in the main scroller and places it just below the top edge, with a
+    brief highlight so the reader sees where they landed. ``sig`` is
+    ``"H<level>|<normalized title>"``, produced by :func:`render_toc`.
+    """
+    payload = json.dumps({"sig": sig}).replace("</", "<\\/")
+    components.html(
+        f"""
+        <script>
+        (function () {{
+          try {{
+            var d = window.parent.document;
+            var P = {payload};
+            // Claim a "recent jump" on the shared parent document so the
+            // demo's scroll-restore script (which re-establishes the last
+            // position for ~7.5 s after each mount) defers to us instead of
+            // fighting the jump. No storage-key coupling: just a timestamp.
+            try {{
+              d['__mdllm_recent_jump'] = String(Date.now());
+            }} catch (e) {{}}
+            var sels = [
+              '[data-testid="stMain"]',
+              '[data-testid="stMainViewContainer"]',
+              'section.main',
+            ];
+            var scroller = null;
+            for (var i = 0; i < sels.length; i++) {{
+              if (scroller) break;
+              var el = d.querySelector(sels[i]);
+              if (el) scroller = el;
+            }}
+            if (!scroller) return;
+            var want = P.sig, sep = want.indexOf('|');
+            var lvl = parseInt(want.slice(1, sep), 10);
+            var title = want.slice(sep + 1);
+            // Mirror reader._normalize_heading: links, tags, span markers,
+            // whitespace runs — so the source heading matches what the
+            // markdown renderer actually produced in the DOM.
+            function norm(t) {{
+              return t.replace(/\\[([^\\]]*)\\]\\([^)]*\\)/g, '$1')
+                      .replace(/<[^>]+>/g, '')
+                      .replace(/[`*_~]/g, '')
+                      .replace(/\\s+/g, ' ').trim();
+            }}
+            // Retry briefly: Streamlit re-renders content in fits and
+            // starts, so the heading may not exist in the DOM yet.
+            var tries = 0;
+            (function poll() {{
+              if (tries > 120) return;
+              tries++;
+              var heads = scroller.querySelectorAll('h1,h2,h3,h4,h5,h6');
+              for (var i = 0; i < heads.length; i++) {{
+                var h = heads[i];
+                if (parseInt(h.tagName.charAt(1), 10) !== lvl) continue;
+                if (norm(h.textContent || '') !== title) continue;
+                var rel = h.getBoundingClientRect().top
+                          - scroller.getBoundingClientRect().top;
+                scroller.scrollTop += rel - 24;
+                h.style.transition = 'background-color 1s';
+                h.style.backgroundColor = 'rgba(214, 40, 40, 0.14)';
+                setTimeout(function () {{
+                  h.style.backgroundColor = '';
+                }}, 1800);
+                return;
+              }}
+              setTimeout(poll, 50);
+            }})();
+          }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
     )
 
 
@@ -216,6 +498,13 @@ def render_reader():
         st.markdown(text, unsafe_allow_html=True)
     else:
         st.code(text, language="text")
+
+    # A sidebar-table-of-contents jump, if one was staged: scroll to the
+    # heading, then drop the staged target so the next rerun doesn't re-jump.
+    jump = st.session_state.get(_TOC_JUMP)
+    if jump:
+        _inject_toc_jump(jump)
+        st.session_state.pop(_TOC_JUMP, None)
 
     # --- Quote a passage into the chat ---------------------------------
     # The content above is read-only DOM: Streamlit never sees the browser's

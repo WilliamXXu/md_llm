@@ -13,6 +13,8 @@ import os
 import tempfile
 import unittest
 
+import streamlit as st
+
 from md_llm import controls, core
 from md_llm.core import Core
 
@@ -168,6 +170,47 @@ class OaiRegistryWriteTests(unittest.TestCase):
         self.assertNotIn("api_key", reg["https://a/v1"])
         self.assertEqual(reg["https://b/v1"]["models"], ["b-model"])
         self.assertEqual(reg["https://b/v1"]["api_key"], "kb")
+
+
+class CurrentOpencodeVariantTests(unittest.TestCase):
+    """_current_opencode_variant resolves the dropdown / custom-input value."""
+
+    def setUp(self):
+        for k in ("llm_opencode_variant_sel", "llm_opencode_variant",
+                  "chat_llm_opencode_variant_sel", "chat_llm_opencode_variant"):
+            st.session_state.pop(k, None)
+
+    def tearDown(self):
+        for k in ("llm_opencode_variant_sel", "llm_opencode_variant",
+                  "chat_llm_opencode_variant_sel", "chat_llm_opencode_variant"):
+            st.session_state.pop(k, None)
+
+    def test_none_when_unset(self):
+        self.assertIsNone(controls._current_opencode_variant())
+
+    def test_none_for_explicit_none_option(self):
+        st.session_state["llm_opencode_variant_sel"] = "(none)"
+        self.assertIsNone(controls._current_opencode_variant())
+
+    def test_returns_preset_selection(self):
+        st.session_state["llm_opencode_variant_sel"] = "high"
+        self.assertEqual(controls._current_opencode_variant(), "high")
+
+    def test_returns_custom_value_when_other_selected(self):
+        st.session_state["llm_opencode_variant_sel"] = "(other — type below)"
+        st.session_state["llm_opencode_variant"] = "  turbo  "
+        self.assertEqual(controls._current_opencode_variant(), "turbo")
+
+    def test_empty_custom_value_resolves_to_none(self):
+        st.session_state["llm_opencode_variant_sel"] = "(other — type below)"
+        st.session_state["llm_opencode_variant"] = "   "
+        self.assertIsNone(controls._current_opencode_variant())
+
+    def test_respects_prefix(self):
+        st.session_state["chat_llm_opencode_variant_sel"] = "max"
+        # Default-prefix key stays unset so it doesn't leak across panels.
+        self.assertIsNone(controls._current_opencode_variant())
+        self.assertEqual(controls._current_opencode_variant("chat_"), "max")
 
 
 if __name__ == "__main__":

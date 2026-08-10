@@ -255,6 +255,24 @@ class OpencodeChatStreamTests(unittest.TestCase):
         self.assertEqual(a[a.index("--attach") + 1], "http://localhost:4096")
         self.assertEqual(a[a.index("--agent") + 1], "build")
 
+    def test_passes_variant_when_given(self):
+        captured, fake = self._capture(
+            [json.dumps({"type": "text", "part": {"text": "ok"}})]
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            list(llm.opencode_chat_stream("hi", model="m", variant="high"))
+        a = captured["args"]
+        self.assertIn("--variant", a)
+        self.assertEqual(a[a.index("--variant") + 1], "high")
+
+    def test_omits_variant_flag_by_default(self):
+        captured, fake = self._capture(
+            [json.dumps({"type": "text", "part": {"text": "ok"}})]
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            list(llm.opencode_chat_stream("hi", model="m"))
+        self.assertNotIn("--variant", captured["args"])
+
     def test_prepends_instruction_to_prompt(self):
         captured, fake = self._capture(
             [json.dumps({"type": "text", "part": {"text": "ok"}})]

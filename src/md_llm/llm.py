@@ -63,6 +63,11 @@ OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
 OPENCODE_BIN = "opencode"
 OPENCODE_DEFAULT_MODEL = ""
 
+# Suggested model variants for `opencode run --variant` (provider-specific
+# reasoning effort). Not exhaustive — values vary by provider; the UI also lets
+# the user type a custom one. Used as the dropdown options in controls.
+OPENCODE_VARIANTS = ["low", "medium", "high", "minimal", "max"]
+
 
 def _join_url(endpoint, path):
     return endpoint.rstrip("/") + path
@@ -852,6 +857,7 @@ def opencode_chat_stream(
     workdir=None,
     attach=None,
     agent=None,
+    variant=None,
     binary=OPENCODE_BIN,
     instruction=None,
     timeout=REQUEST_TIMEOUT,
@@ -863,7 +869,8 @@ def opencode_chat_stream(
     line; ``text`` events are yielded as assistant chunks, ``tool_use`` events
     are surfaced inline as a one-line marker, and an ``error`` event (or a
     non-zero exit) raises :class:`RuntimeError`. If ``instruction`` is given it
-    is prepended to the prompt.
+    is prepended to the prompt. If ``variant`` is given it is forwarded as
+    ``--variant`` (provider-specific reasoning effort).
 
     Auth + model routing are OpenCode's own (configure via ``opencode auth
     login`` / env). Token-level streaming is unavailable on this path; text
@@ -884,6 +891,8 @@ def opencode_chat_stream(
     args = [binary, "run", "--format", "json", "--auto"]
     if model:
         args += ["--model", model]
+    if variant:
+        args += ["--variant", variant]
     if workdir:
         args += ["--dir", workdir]
     if attach:
