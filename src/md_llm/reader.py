@@ -1,9 +1,12 @@
 """Reader panel: open any document (markdown/text) as a clean, full-text view.
 
 A host stages a file by calling :func:`open_in_reader` (which records the target
-in session state and switches the host's active tab here). The panel renders the
-file, offers copy-to-clipboard, lets the user quote a passage to send to the
-chat, and shows a read-only summary of the current chat config.
+in session state and switches the host's active tab here). With ``keep_open=True``
+the file joins the open-documents registry and becomes the active one — each
+open document gets its own Reader view and an independent LLM chat (see
+:mod:`md_llm.docs`). The panel renders the file, offers copy-to-clipboard, lets
+the user quote a passage to send to the chat, and shows a read-only summary of
+the current chat config.
 
 Path safety: the staged relpath is resolved against ``core.base_dir`` and the
 resulting absolute path must sit inside one of ``core.markdown_dirs``; anything
@@ -25,6 +28,7 @@ import re
 import streamlit as st
 import streamlit.components.v1 as components
 
+from . import docs
 from . import llm as _llm
 from .controls import _current_llm_model
 from .core import get_core
@@ -57,12 +61,28 @@ _TOC_OPEN_CTX = "_reader_toc_open_ctx"
 # gutter. Keyed rows are `_reader_toc_l<level>_<i>` and levels > 5 share the
 # l5 depth so the panel never collapses.
 _TOC_CSS = """
+[class*="st-key-_reader_toc_area"] h3 {
+    font-size: 0.95rem !important;
+    margin: 0 0 0.25rem 0 !important;
+}
+[class*="st-key-_reader_toc_area"] [data-testid="stVerticalBlock"] {
+    gap: 0.1rem !important;
+}
+[class*="st-key-_reader_toc_area"] button {
+    min-height: 0 !important;
+    height: auto !important;
+    line-height: 1.2 !important;
+    padding: 0.1rem 0.4rem !important;
+    margin-top: 0.05rem !important;
+    margin-bottom: 0.05rem !important;
+}
 [class*="st-key-_reader_toc_l1"] button {
     font-weight: 700;
+    font-size: 0.78em !important;
     border-left: 3px solid rgb(214, 40, 40);
 }
 [class*="st-key-_reader_toc_l1"] button > div { padding-left: 0.45rem; }
-[class*="st-key-_reader_toc_l2"] button { margin-left: 0.7rem; }
+[class*="st-key-_reader_toc_l2"] button { margin-left: 0.7rem; font-size: 0.72em !important; }
 [class*="st-key-_reader_toc_l3"] button { margin-left: 1.4rem; }
 [class*="st-key-_reader_toc_l4"] button { margin-left: 2.1rem; }
 [class*="st-key-_reader_toc_l5"] button { margin-left: 2.1rem; }
@@ -75,7 +95,7 @@ _TOC_CSS = """
 }
 [class*="st-key-_reader_toc_l3"] button,
 [class*="st-key-_reader_toc_l4"] button,
-[class*="st-key-_reader_toc_l5"] button { font-size: 0.93em; }
+[class*="st-key-_reader_toc_l5"] button { font-size: 0.68em !important; }
 """
 
 
@@ -128,6 +148,26 @@ def _toc_auto_open(roots):
 # The text_area widget key for the quote box (Reader-internal).
 _READER_QUOTE_AREA = "_reader_quote_area"
 
+
+def _reader_quote_key():
+    """Session key of the quote staged for the ACTIVE chat session.
+
+    Scoped per document AND per chat session (see :mod:`md_llm.docs`) so a
+    passage quoted from one document can never attach to another's
+    conversation, and a quote always lands in the chat session that was active
+    when it was staged. Falls back to the legacy bare key in single-document
+    mode with a single session.
+    """
+    doc = docs.active_document()
+    return docs.chat_key(_READER_QUOTE, docs.active_chat(doc), doc)
+
+
+def _reader_quote_area_key():
+    """Session key of the quote textarea widget for the ACTIVE chat session."""
+    doc = docs.active_document()
+    return docs.chat_key(_READER_QUOTE_AREA, docs.active_chat(doc), doc)
+
+
 # The st.tabs() key in the host app — writing its session-state value switches
 # the active tab. Exported so the host uses this exact key.
 TABS_KEY = "_app_tabs"
@@ -135,14 +175,24 @@ READER_TAB_LABEL = "Reader"
 CHAT_TAB_LABEL = "LLM chat"
 
 
-def open_in_reader(relpath):
+def open_in_reader(relpath, keep_open=False):
     """Record `relpath` as the reader target and jump to the Reader tab.
 
     Streamlit tabs are widgets (keyed), so assigning the tab's session-state
     value moves the active tab — no new browser tab, no link navigation.
+
+    With ``keep_open=True`` the document is opened in multi-document mode
+    (see :mod:`md_llm.docs`): it joins the registry of open documents and
+    becomes the active one, each document keeping its own independent LLM
+    chat. The default keeps today's single-document behaviour — any previously
+    open documents are dropped and the session returns to the legacy keys.
     """
     if relpath:
         st.session_state[_READER_TARGET] = relpath
+    if keep_open:
+        docs.add_document(relpath)
+    else:
+        docs.reset_documents()
     st.session_state[TABS_KEY] = READER_TAB_LABEL
 
 
@@ -354,10 +404,11 @@ def _inject_toc_jump(sig):
 
     The Reader's content is plain render-only DOM — Streamlit knows nothing
     about the headings inside it — so a tiny same-origin iframe script (the
-    same escape hatch ``demo._preserve_reader_scroll`` uses) finds the heading
-    element in the main scroller and places it just below the top edge, with a
-    brief highlight so the reader sees where they landed. ``sig`` is
-    ``"H<level>|<normalized title>"``, produced by :func:`render_toc`.
+    same escape hatch ``demo._preserve_reader_scroll`` uses to remember the
+    TOC location) finds the heading element in the main scroller and places
+    it just below the top edge, with a brief highlight so the reader sees
+    where they landed. ``sig`` is ``"H<level>|<normalized title>"``, produced
+    by :func:`render_toc`.
     """
     payload = json.dumps({"sig": sig}).replace("</", "<\\/")
     components.html(
@@ -513,14 +564,19 @@ def render_reader():
     # panel — alongside the full document, which is always sent as context.
     st.divider()
     with st.expander("Quote a passage for the LLM chat", expanded=False):
+        _sess_label = docs.chat_session_label(
+            docs.active_document(), docs.active_chat(docs.active_document())
+        )
         st.caption(
             "_Select text above, copy it, paste it here, then **Send to chat**. "
-            "The quote is attached to your next question in the chat — the full "
-            "document is still sent as context too._"
+            f"The quote is attached to your next question in "
+            f"**{_sess_label}** — the full document is still sent as context "
+            "too._"
         )
         st.text_area(
-            "Quote for chat", value=st.session_state.get(_READER_QUOTE, ""),
-            height=120, key=_READER_QUOTE_AREA,
+            "Quote for chat",
+            value=st.session_state.get(_reader_quote_key(), ""),
+            height=120, key=_reader_quote_area_key(),
             placeholder="Paste the passage you want to ask about…",
         )
         col_send, col_clear = st.columns([1, 1])
@@ -529,9 +585,9 @@ def render_reader():
             help="Stage this quote for the next chat question, then switch to "
                  "the LLM chat tab.",
         ):
-            quote = (st.session_state.get(_READER_QUOTE_AREA) or "").strip()
+            quote = (st.session_state.get(_reader_quote_area_key()) or "").strip()
             if quote:
-                st.session_state[_READER_QUOTE] = quote
+                st.session_state[_reader_quote_key()] = quote
                 st.session_state[TABS_KEY] = CHAT_TAB_LABEL
                 st.rerun()
             else:
@@ -539,8 +595,8 @@ def render_reader():
         if col_clear.button(
             "Clear", help="Drop the staged quote so it is no longer attached.",
         ):
-            st.session_state.pop(_READER_QUOTE, None)
-            st.session_state[_READER_QUOTE_AREA] = ""
+            st.session_state.pop(_reader_quote_key(), None)
+            st.session_state[_reader_quote_area_key()] = ""
             st.rerun()
 
     # A compact read-only summary of the current chat config + a jump button.
@@ -554,11 +610,20 @@ def render_reader():
 
 
 def _close_reader():
-    """Drop the reader target (wired as the "Clear" button's on_click callback).
+    """Drop the active document (wired as the "Clear" button's on_click).
 
-    Also clears any staged quote, so a passage quoted from one document can't
-    leak into a chat about another.
+    In multi-document mode the document is removed from the registry — its
+    chat state is dropped and the next open document becomes active, so a
+    passage quoted from one document can't leak into a chat about another. In
+    single-document mode the reader target (and any staged quote) is cleared.
     """
-    st.session_state.pop(_READER_TARGET, None)
-    st.session_state.pop(_READER_QUOTE, None)
-    st.session_state[_READER_QUOTE_AREA] = ""
+    doc = docs.active_document()
+    if doc:
+        docs.remove_document(doc)
+    else:
+        st.session_state.pop(_READER_TARGET, None)
+        # In single-document mode, clear the staged quotes of every chat
+        # session of this (now closed) document.
+        for sid in docs.chat_sessions(""):
+            st.session_state.pop(docs.chat_key(_READER_QUOTE, sid, ""), None)
+            st.session_state.pop(docs.chat_key(_READER_QUOTE_AREA, sid, ""), None)

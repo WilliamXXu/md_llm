@@ -6,6 +6,22 @@ Reader currently has open (``_reader_target``). Open a document in the Reader,
 then ask about it here. The document's full text is sent once as the leading
 context turn, so the model has it in mind for the whole conversation.
 
+With several documents open (multi-document mode, see :mod:`md_llm.docs`) the
+chat still follows the ACTIVE document, and each document's conversation is
+stored under its own namespaced session keys
+(``_chat_messages__doc__<relpath>``) — so each open document has a fully
+independent chat that keeps streaming in the background while you work on
+another.
+
+On top of that, any document can hold **several chat sessions** ("tabs"):
+the session buttons at the top of this panel pick the active one, ``+ New``
+opens another independent conversation about the same document, and ``✕``
+closes the current one. Each session keeps its own conversation, background
+stream task, last error, and staged Reader quote, keyed via
+``docs.chat_key`` as ``<base>__chat__<id>__doc__<relpath>`` (session 1 keeps
+the document's legacy keys). Provider/model/key controls are shared panel-wide
+— sessions differ only in their conversations and streams.
+
 The assistant reply is streamed token-by-token via ``st.write_stream`` (both
 OpenRouter's SSE deltas and Ollama's newline-delimited chunks are supported).
 
@@ -27,6 +43,7 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from . import llm
+from . import docs
 from .autossh import _render_autossh_panel
 from .console import log_event
 from .controls import (
@@ -58,6 +75,24 @@ _CHAT_BG_TASK = "_chat_bg_task"
 # question. Read here by literal string (matches reader.py) rather than imported
 # from .reader, to keep chat↔reader decoupled. Cleared once attached.
 _READER_QUOTE = "_reader_quote"
+
+
+def _chat_state_key(base):
+    """Session-state key for one chat field, scoped to the active session.
+
+    Each open document's ACTIVE chat session owns its own conversation /
+    stream task / last error (see :mod:`md_llm.docs`), so chats run
+    independently no matter how many documents or sessions exist. Session 1 of
+    a document uses its legacy keys, so existing sessions are untouched.
+    """
+    doc = docs.active_document()
+    return docs.chat_key(base, docs.active_chat(doc), doc)
+
+
+def _staged_quote_key():
+    """Session key of the Reader quote staged for the ACTIVE session's chat."""
+    doc = docs.active_document()
+    return docs.chat_key(_READER_QUOTE, docs.active_chat(doc), doc)
 
 
 def _resolve(path):
@@ -134,7 +169,7 @@ def _render_chat_as_markdown(context_path, provider, model):
             lines.append("")
             lines.append("---")
             lines.append("")
-    for m in (st.session_state.get(_CHAT_MESSAGES) or []):
+    for m in (st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or []):
         role = m.get("role", "")
         content = (m.get("content") or "").rstrip()
         if role == "user":
@@ -213,7 +248,7 @@ def _save_conversation(context_path, provider, model):
     Returns the saved absolute path, or None on failure / when the conversation
     is empty.
     """
-    messages = st.session_state.get(_CHAT_MESSAGES) or []
+    messages = st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or []
     if not messages:
         st.warning("Nothing to save — the conversation is empty.")
         return None
@@ -257,7 +292,7 @@ def _send_context_and_turns(context_path):
                 "content": "Got it — I've read the document. "
                            "What would you like to know?",
             })
-    turns = list(st.session_state.get(_CHAT_MESSAGES) or [])
+    turns = list(st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or [])
     _attach_quote_to_last_turn(turns)
     messages.extend(turns)
     return messages
@@ -267,9 +302,10 @@ def _attach_quote_to_last_turn(turns):
     """Prepend any staged Reader quote to the last user turn, then clear it.
 
     Operates on a shallow copy of the turn list (the caller owns the live
-    session-state list).
+    session-state list). The quote is scoped to the active document, so it can
+    only ever attach to the chat it was quoted for.
     """
-    quote = st.session_state.get(_READER_QUOTE)
+    quote = st.session_state.get(_staged_quote_key())
     if not quote:
         return
     if not turns or turns[-1].get("role") != "user":
@@ -280,7 +316,7 @@ def _attach_quote_to_last_turn(turns):
         f"> {quote}\n\n{last['content']}"
     )
     turns[-1] = last
-    st.session_state.pop(_READER_QUOTE, None)
+    st.session_state.pop(_staged_quote_key(), None)
 
 
 def _turns_to_opencode_prompt(turns):
@@ -502,6 +538,51 @@ def render_chat():
     """
     st.subheader("LLM chat")
 
+    # --- Chat sessions for this document -------------------------------
+    # A document can hold several independent chat sessions ("tabs"): each has
+    # its own conversation, stream task, staged quote, and last error (see
+    # docs.chat_key). Session buttons pick the active one (the active session
+    # is highlighted); "+ New" opens another independent conversation about
+    # the same document; "Close" drops the current one (never the last
+    # remaining session).
+    _doc = docs.active_document()
+    sessions = docs.chat_sessions(_doc)
+    cur = docs.active_chat(_doc)
+
+    # Session switch buttons — one per session, active one highlighted.
+    # Rendered only when there is more than one session (nothing to switch
+    # between otherwise); "+ New" below creates additional sessions.
+    if len(sessions) > 1:
+        sess_cols = st.columns(len(sessions))
+        for i, sid in enumerate(sessions):
+            if sess_cols[i].button(
+                docs.chat_session_label(_doc, sid),
+                key=f"_md_llm_chat_btn_{sid}_{_doc}",
+                type="primary" if sid == cur else "secondary",
+                use_container_width=True,
+                help="Switch to this chat session.",
+            ):
+                if sid != cur:
+                    docs.set_active_chat(sid, _doc)
+                    st.rerun()
+
+    # "+ New" opens another independent conversation; "Close" drops the
+    # current session (never the last remaining one).
+    col_new, col_close, _ = st.columns([1, 1, 3])
+    if col_new.button(
+        "+ New",
+        help="Open another independent chat session for this document.",
+    ):
+        docs.add_chat(_doc)
+        st.rerun()
+    if col_close.button(
+        "Close",
+        disabled=len(sessions) <= 1,
+        help="Close this chat session and drop its conversation.",
+    ):
+        docs.remove_chat(cur, _doc)
+        st.rerun()
+
     # Restore the chat panel's controls from the in-memory snapshot before any
     # widget mounts, so a Reader -> chat round-trip keeps the user's provider /
     # model / endpoint / key selections (Streamlit otherwise prunes unmounted
@@ -536,6 +617,17 @@ def render_chat():
             "_Nothing open in the Reader — your messages go straight to the LLM "
             "with no document context. Open a document there to discuss it._"
         )
+    if docs.is_multi():
+        st.caption(
+            f"**{len(docs.open_documents())} documents open** — each keeps its "
+            "own independent chat. Switch the active document in the sidebar; "
+            "this panel always shows the active document's conversation."
+        )
+    st.caption(
+        f"Showing **{docs.chat_session_label(_doc, cur)}** — {len(sessions)} "
+        "independent chat session(s) for this document. Each session keeps "
+        "its own conversation and background stream."
+    )
     st.caption(
         "The provider/model/key live in the LLM controls expander below. The "
         "conversation lives in memory for this session only."
@@ -543,7 +635,7 @@ def render_chat():
 
     # Show a staged Reader quote so the user knows their next question carries
     # it as focused context (alongside the full document).
-    staged_quote = st.session_state.get(_READER_QUOTE)
+    staged_quote = st.session_state.get(_staged_quote_key())
     if staged_quote:
         st.info(
             f"**Quote attached to your next question** (alongside the full "
@@ -551,7 +643,7 @@ def render_chat():
         )
         if st.button("Drop quote", help="Don't attach the staged passage to "
                      "the next question after all."):
-            st.session_state.pop(_READER_QUOTE, None)
+            st.session_state.pop(_staged_quote_key(), None)
             st.rerun()
 
     # --- Controls (the only place chat_* widgets are instantiated) ------
@@ -583,8 +675,8 @@ def render_chat():
             st.success(f"Saved: `{os.path.basename(saved)}`")
             st.rerun()
     if col_clear.button("Clear conversation", help="Reset the chat history."):
-        st.session_state.pop(_CHAT_MESSAGES, None)
-        st.session_state.pop(_CHAT_BG_TASK, None)
+        st.session_state.pop(_chat_state_key(_CHAT_MESSAGES), None)
+        st.session_state.pop(_chat_state_key(_CHAT_BG_TASK), None)
         st.rerun()
 
     st.divider()
@@ -594,13 +686,13 @@ def render_chat():
     st.markdown(_BODY_FONT_SIZE_CSS, unsafe_allow_html=True)
 
     # --- Chat history --------------------------------------------------
-    messages = st.session_state.get(_CHAT_MESSAGES) or []
+    messages = st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or []
     for m in messages:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
     # Surface the last failed call as a transient bubble (not stored).
-    err = st.session_state.pop("_chat_last_error", None)
+    err = st.session_state.pop(_chat_state_key("_chat_last_error"), None)
     if err:
         with st.chat_message("assistant"):
             st.error(f"LLM call failed: {err}")
@@ -610,16 +702,18 @@ def render_chat():
     # the Reader mid-reply no longer cancels it — the call (and OpenCode's
     # subprocess) keeps running at the back end. Here we finalize once when
     # done, and otherwise stream the partial reply + poll.
-    task = st.session_state.get(_CHAT_BG_TASK)
+    task = st.session_state.get(_chat_state_key(_CHAT_BG_TASK))
     if task:
         if task.get("done"):
             if task.get("error"):
-                st.session_state["_chat_last_error"] = task["error"]
+                st.session_state[_chat_state_key("_chat_last_error")] = task["error"]
                 log_event(f"Chat failed: {task['error']}", level="error",
                           source=task.get("source", ""))
             else:
                 reply_text = (task.get("text") or "").strip()
-                st.session_state.setdefault(_CHAT_MESSAGES, []).append({
+                st.session_state.setdefault(
+                    _chat_state_key(_CHAT_MESSAGES), []
+                ).append({
                     "role": "assistant",
                     "content": reply_text
                     or "_(empty response — nothing came back.)_",
@@ -630,7 +724,7 @@ def render_chat():
                 else:
                     log_event("Chat reply empty — nothing came back.",
                               level="warn", source=task.get("source", ""))
-            st.session_state.pop(_CHAT_BG_TASK, None)
+            st.session_state.pop(_chat_state_key(_CHAT_BG_TASK), None)
             st.rerun()
         # Still running: show the partial reply and poll. The work continues in
         # the background thread regardless of which tab is active.
@@ -658,25 +752,26 @@ def render_chat():
         preview = prompt.strip().replace("\n", " ")[:80]
         log_event(f"Chat send → {preview}", level="info", source=chat_src)
 
-        msgs = st.session_state.setdefault(_CHAT_MESSAGES, [])
+        msgs = st.session_state.setdefault(_chat_state_key(_CHAT_MESSAGES), [])
         msgs.append({"role": "user", "content": prompt})
         holder = {}
         stream, verr = _build_stream(context_path, holder)
         if stream is None:
             msgs.pop()  # validation failed: roll back the dangling question
-            st.session_state["_chat_last_error"] = verr
+            st.session_state[_chat_state_key("_chat_last_error")] = verr
             log_event(f"Chat failed: {verr}", level="error", source=chat_src)
         else:
             # Hand the stream to a background thread so the call (and any
             # subprocess it drives, e.g. `opencode run`) keeps running when the
-            # user switches tabs. st.write_stream would be cancelled by the
-            # tab-switch rerun, and the stream's generator kills its subprocess
-            # on close. The poll block above drains `task` for live display.
+            # user switches tabs or switches to another open document's chat.
+            # st.write_stream would be cancelled by the tab-switch rerun, and
+            # the stream's generator kills its subprocess on close. The poll
+            # block above drains `task` for live display.
             task = {"text": "", "done": False, "error": None, "source": chat_src}
             worker = threading.Thread(
                 target=_stream_worker, args=(task, stream, holder),
                 daemon=True,
             )
-            st.session_state[_CHAT_BG_TASK] = task
+            st.session_state[_chat_state_key(_CHAT_BG_TASK)] = task
             worker.start()
         st.rerun()

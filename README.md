@@ -70,6 +70,52 @@ with st.sidebar:
     md_llm.render_toc()   # no-op while nothing / a non-.md file is open
 ```
 
+### Optional: multiple open documents, each with an independent chat
+
+By default one document is open at a time. To open several files — each with
+its own Reader view and an **independent** LLM chat (separate conversation
+history, streaming task, staged quotes) — pass `keep_open=True` when staging,
+and mount the document picker in your sidebar:
+
+```python
+md_llm.open_in_reader("notes.md", keep_open=True)    # open + activate
+md_llm.open_in_reader("report.md", keep_open=True)   # another one
+
+with st.sidebar:
+    md_llm.render_doc_buttons()   # one button per open document (+ Close each)
+```
+
+- `md_llm.open_documents()` returns the ordered relpaths of the open
+  documents; `md_llm.add_document(rel)` / `md_llm.remove_document(rel)` manage
+  the list programmatically.
+- The **active** document drives both the Reader and the chat tab. Each open
+  document's conversation is stored under its own namespaced session keys
+  (`_chat_messages__doc__<relpath>`), so chats never mix and keep running in
+  the background while you work on another document.
+- Closing a document (a button's Close, or the Reader's Clear) drops its chat
+  state and activates the next open document. Closing the last one — or
+  calling `open_in_reader(rel)` without `keep_open` — returns the session to
+  single-document mode and its legacy keys.
+
+### Optional: several independent chat sessions per document
+
+By default each document has a single chat. From the chat panel, **+ New**
+opens another independent chat session ("tab") for the same document, and the
+session selector switches between them — each session keeps its own
+conversation history, background stream task, staged Reader quotes, and last
+error, so chats about the same file never mix:
+
+- Sessions are numbered `Chat 1`, `Chat 2`, …; the first one keeps the
+  document's legacy keys, later ones live under `__chat__<id>`-namespaced
+  session keys, and the last remaining session cannot be closed (**Close** is
+  disabled).
+- The provider/model/key controls are shared panel-wide; sessions differ only
+  in their conversations and streams, which keep running in the background
+  while you switch sessions or documents.
+- A passage quoted in the Reader ("Send to chat") attaches to the chat session
+  that was active when it was staged — the Reader names the target session.
+- Closing a document drops all of its sessions.
+
 ### Optional: forward md_llm events into a host console
 
 ```python
@@ -83,8 +129,12 @@ set_logger(my_console.log_event)   # md_llm will call this for chat send/reply/e
 streamlit run src/md_llm/demo.py
 ```
 
-Opens a sidebar directory picker; reads + chats about any `.md` / `.txt` in the
-chosen directory. Zero host code required.
+Opens a sidebar file picker (shift-click to pick several); reads + chats about
+any `.md` / `.txt` files. Everything lives in the sidebar: one button per open
+document (taking the place of the old "Reader" view button), then — once a
+document is open — that document's LLM chat with its session tabs, and the
+clickable table of contents. The main area is just the Reader. Zero host code
+required.
 
 ## How it's decoupled
 
@@ -99,14 +149,15 @@ dict on disk; the OpenAI-compatible endpoint/model/key registry lives under the
 
 ```
 src/md_llm/
-├── __init__.py   # public API: Core, init, render_reader, render_toc, render_chat, open_in_reader, TABS_KEY, *_TAB_LABEL
+├── __init__.py   # public API: Core, init, render_reader, render_toc, render_chat, open_in_reader, render_doc_selector, render_doc_buttons, open_documents, add_document, remove_document, TABS_KEY, *_TAB_LABEL
 ├── core.py       # Core dataclass + init/get_core (dependency-injected host config)
 ├── llm.py        # stdlib-only LLM clients (Ollama / OpenRouter / OpenAI-compatible / OpenCode)
 ├── state.py      # generic helpers: _read_text, _human_size, _display_name_for_filepath
 ├── console.py    # log_event + set_logger hook (forwards to host console)
 ├── controls.py   # provider/model/endpoint widgets + per-endpoint OAI registry
 ├── autossh.py    # optional remote Ollama SSH tunnel panel
+├── docs.py       # optional multi-document registry + per-doc chat-session registry + sidebar picker
 ├── reader.py     # render_reader + render_toc — markdown/text viewer, clickable TOC, quote-to-chat
-├── chat.py       # render_chat — streaming multi-turn chat
+├── chat.py       # render_chat — streaming multi-turn chat (independent per open doc AND per session)
 └── demo.py       # standalone Streamlit entry point
 ```
