@@ -35,6 +35,7 @@ from .core import get_core
 from .state import (
     _BODY_FONT_SIZE_CSS,
     _display_name_for_filepath,
+    _escape_currency_dollars,
     _human_size,
     _read_text,
 )
@@ -546,7 +547,7 @@ def render_reader():
     # render alongside standard **bold** markdown — without it Streamlit strips
     # the tags and shows their inner text unstyled.
     if target.endswith(".md"):
-        st.markdown(text, unsafe_allow_html=True)
+        st.markdown(_escape_currency_dollars(text), unsafe_allow_html=True)
     else:
         st.code(text, language="text")
 

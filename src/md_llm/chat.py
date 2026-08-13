@@ -61,6 +61,7 @@ from .state import (
     DEFAULT_LLM_AUTOSSH,
     _BODY_FONT_SIZE_CSS,
     _display_name_for_filepath,
+    _escape_currency_dollars,
     _read_text,
 )
 
@@ -689,7 +690,7 @@ def render_chat():
     messages = st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or []
     for m in messages:
         with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+            st.markdown(_escape_currency_dollars(m["content"]))
 
     # Surface the last failed call as a transient bubble (not stored).
     err = st.session_state.pop(_chat_state_key("_chat_last_error"), None)
@@ -731,7 +732,7 @@ def render_chat():
         with st.chat_message("assistant"):
             body = task.get("text") or ""
             if body:
-                st.markdown(body + " ▌")
+                st.markdown(_escape_currency_dollars(body) + " ▌")
             else:
                 st.caption(
                     "_working… (running in the background — switching tabs is "

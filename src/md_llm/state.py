@@ -9,6 +9,7 @@ Kept free of any host-specific (transcript / YouTube / Whisper) concepts.
 from __future__ import annotations
 
 import os
+import re
 
 from .core import get_core
 
@@ -64,6 +65,40 @@ def _read_text(path):
             return f.read()
     except OSError:
         return ""
+
+
+# Code spans/fences are rendered literally by the markdown processor, so a
+# backslash inside them would show up verbatim — never touch a $ there.
+_CODE_BLOCK_OR_SPAN = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
+
+# A $ that is NOT already escaped and is immediately followed by a digit
+# (optionally with commas/periods) — e.g. $2.5B, $1,500, $3.7B. Genuine math
+# like $x^2$ or $\frac{a}{b}$ doesn't start with a bare digit, so it's safe.
+_CURRENCY_DOLLAR = re.compile(r"(?<!\\)\$(?=\d[\d.,]*)")
+
+
+def _escape_currency_dollars(text):
+    """Escape ``$`` signs that look like currency, not LaTeX math.
+
+    Streamlit's ``st.markdown`` parses ``$...$`` as KaTeX math. In prose a lone
+    ``$`` almost always denotes a dollar amount (``$2.5B``, ``$1,500``); pairs of
+    them get mis-paired into one huge math span that garbles the enclosed text
+    (spaces dropped, letters treated as separate variables, ``**`` -> ``*``).
+    We escape such ``$`` to ``\\$`` (which renders as a literal ``$``) — but only
+    ``$`` followed by a digit, so genuine math (``$x^2$``, ``$\\frac{a}{b}$``)
+    is untouched. Code spans/fences are skipped: their content is literal, so a
+    backslash there would appear verbatim.
+    """
+    if not text or "$" not in text:
+        return text
+    out = []
+    last = 0
+    for m in _CODE_BLOCK_OR_SPAN.finditer(text):
+        out.append(_CURRENCY_DOLLAR.sub(r"\\$", text[last:m.start()]))
+        out.append(m.group(0))
+        last = m.end()
+    out.append(_CURRENCY_DOLLAR.sub(r"\\$", text[last:]))
+    return "".join(out)
 
 
 def _load_title_sidecar(path):
