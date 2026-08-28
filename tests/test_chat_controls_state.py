@@ -51,11 +51,27 @@ class ChatControlKeysTests(unittest.TestCase):
         st.session_state["_chat_bg_task"] = {"done": True}
         st.session_state["_chat_autossh_proc"] = object()  # a tracked Popen
         st.session_state["_chat_autossh_start"] = False  # button key
+        st.session_state["_chat_opencode_clear_sandbox"] = False  # button key
         keys = set(chat._chat_control_keys())
         self.assertNotIn("_chat_messages", keys)
         self.assertNotIn("_chat_bg_task", keys)
         self.assertNotIn("_chat_autossh_proc", keys)
         self.assertNotIn("_chat_autossh_start", keys)
+        self.assertNotIn("_chat_opencode_clear_sandbox", keys)
+
+    def test_button_widget_keys_must_live_outside_snapshot_prefixes(self):
+        # Regression: the OpenCode clear-sandbox button was originally keyed
+        # "chat_llm_opencode_clear_sandbox". That landed in every snapshot and
+        # _restore_chat_controls re-injected it before mount — Streamlit then
+        # raised StreamlitValueAssignmentNotAllowedError (button keys may never
+        # be set via st.session_state). Guard: any key a BUTTON binds must
+        # start with "_" so the chat_* snapshot never captures it.
+        st.session_state["chat_llm_opencode_hardened"] = True  # checkbox: ok
+        st.session_state["chat_llm_opencode_workdir"] = ""     # text input: ok
+        from md_llm import controls
+        self.assertTrue(controls.OPENCODE_CLEAR_SANDBOX_KEY.startswith("_"))
+        keys = set(chat._chat_control_keys())
+        self.assertNotIn(controls.OPENCODE_CLEAR_SANDBOX_KEY, keys)
 
 
 class SnapshotChatControlsTests(unittest.TestCase):

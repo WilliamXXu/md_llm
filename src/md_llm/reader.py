@@ -4,9 +4,8 @@ A host stages a file by calling :func:`open_in_reader` (which records the target
 in session state and switches the host's active tab here). With ``keep_open=True``
 the file joins the open-documents registry and becomes the active one — each
 open document gets its own Reader view and an independent LLM chat (see
-:mod:`md_llm.docs`). The panel renders the file, offers copy-to-clipboard, lets
-the user quote a passage to send to the chat, and shows a read-only summary of
-the current chat config.
+:mod:`md_llm.docs`). The panel renders the file, offers copy-to-clipboard, and
+lets the user quote a passage to send to the chat.
 
 Path safety: the staged relpath is resolved against ``core.base_dir`` and the
 resulting absolute path must sit inside one of ``core.markdown_dirs``; anything
@@ -29,8 +28,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from . import docs
-from . import llm as _llm
-from .controls import _current_llm_model
 from .core import get_core
 from .state import (
     _BODY_FONT_SIZE_CSS,
@@ -384,7 +381,6 @@ def _render_toc_nodes(nodes, open_ids):
             f"{caret}{title}",
             key=_toc_row_key(node["depth"], node_id),
             use_container_width=True,
-            help=f"Jump to “{title}”",
         ):
             if has_children:
                 if opened:
@@ -481,29 +477,6 @@ def _inject_toc_jump(sig):
     )
 
 
-def _render_chat_config_summary():
-    """A read-only summary of the LLM chat config (no editable widgets here).
-
-    The editable controls live in the chat panel (the only place the chat_*
-    widget keys are instantiated). We can't render the same widgets here without
-    a duplicate-key collision (every tab mounts its widgets on every run), so
-    the Reader just reports the current values and offers a jump button.
-    """
-    provider = st.session_state.get("chat_llm_provider", "OpenRouter")
-    model = _current_llm_model(prefix="chat_") or _llm.OPENROUTER_DEFAULT_MODEL
-    if provider == "OpenRouter":
-        key_status = (
-            "set" if st.session_state.get("chat_llm_or_api_key")
-            or os.environ.get("OPENROUTER_API_KEY")
-            else "missing"
-        )
-    else:
-        key_status = "n/a"
-    st.caption(
-        f"Provider: **{provider}**  ·  Model: `{model}`  ·  API key: {key_status}"
-    )
-
-
 def render_reader():
     """Render the Reader panel: show the file targeted by ``open_in_reader``."""
     st.subheader("Reader")
@@ -534,7 +507,7 @@ def render_reader():
     with col_copy:
         _copy_text_button(text)
     with col_clear:
-        st.button("Clear", on_click=_close_reader)
+        st.button("Clear", on_click=_close_reader, key="_reader_close_doc_btn")
 
     # Permanently bump body-text + code font size. Scoped to Streamlit's
     # markdown/code containers so widget labels, buttons, and headers keep their
@@ -581,11 +554,7 @@ def render_reader():
             placeholder="Paste the passage you want to ask about…",
         )
         col_send, col_clear = st.columns([1, 1])
-        if col_send.button(
-            "Send to chat", type="primary",
-            help="Stage this quote for the next chat question, then switch to "
-                 "the LLM chat tab.",
-        ):
+        if col_send.button("Send to chat", type="primary"):
             quote = (st.session_state.get(_reader_quote_area_key()) or "").strip()
             if quote:
                 st.session_state[_reader_quote_key()] = quote
@@ -593,20 +562,9 @@ def render_reader():
                 st.rerun()
             else:
                 st.warning("Paste a passage into the box first.")
-        if col_clear.button(
-            "Clear", help="Drop the staged quote so it is no longer attached.",
-        ):
+        if col_clear.button("Clear", key="_reader_clear_quote_btn"):
             st.session_state.pop(_reader_quote_key(), None)
             st.session_state[_reader_quote_area_key()] = ""
-            st.rerun()
-
-    # A compact read-only summary of the current chat config + a jump button.
-    st.divider()
-    with st.expander("LLM chat — about this document", expanded=False):
-        _render_chat_config_summary()
-        if st.button("Open chat", help="Switch to the LLM chat tab to "
-                     "converse about this document."):
-            st.session_state[TABS_KEY] = CHAT_TAB_LABEL
             st.rerun()
 
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import re
 
-from .core import get_core
 
 
 # Proportional content zoom for the Reader and Chat panels. Unlike a flat
@@ -42,6 +41,20 @@ _BODY_FONT_SIZE_CSS = f"""
 [data-testid="stMarkdownContainer"] b {{
   font-weight: 800;
   color: {_BOLD_COLOR};
+}}
+/* Blockquotes (``> callouts``) render as plain paragraphs, not boxes:
+   strip the border / padding / background Streamlit gives them. Covers
+   the Reader's documents and chat-message bodies alike. */
+.stMarkdown blockquote,
+[data-testid="stMarkdownContainer"] blockquote {{
+  border-left: none;
+  padding: 0;
+  margin: 0 0 0.75rem 0;
+  background: transparent;
+}}
+.stMarkdown blockquote p,
+[data-testid="stMarkdownContainer"] blockquote p {{
+  margin: 0 0 0.35rem 0;
 }}
 </style>
 """

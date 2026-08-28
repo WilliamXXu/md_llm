@@ -24,6 +24,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import sandbox
+
 DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
 DEFAULT_MODEL = ""
 # Default instruction for the Transcripts & LLM and Autopilot panels. The chat
@@ -71,6 +73,14 @@ OPENCODE_VARIANTS = ["low", "medium", "high", "minimal", "max"]
 
 def _join_url(endpoint, path):
     return endpoint.rstrip("/") + path
+
+
+def _unlink_quietly(path):
+    """Best-effort file removal (temp Seatbelt profiles); never raises."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def list_ollama_models(endpoint=DEFAULT_ENDPOINT, timeout=10):
@@ -860,6 +870,7 @@ def opencode_chat_stream(
     variant=None,
     binary=OPENCODE_BIN,
     instruction=None,
+    hardened=False,
     timeout=REQUEST_TIMEOUT,
 ):
     """Run ``opencode run --format json --auto`` and stream assistant text.
@@ -871,6 +882,11 @@ def opencode_chat_stream(
     non-zero exit) raises :class:`RuntimeError`. If ``instruction`` is given it
     is prepended to the prompt. If ``variant`` is given it is forwarded as
     ``--variant`` (provider-specific reasoning effort).
+
+    With ``hardened=True`` (macOS) the subprocess runs under a generated
+    Seatbelt profile (:mod:`md_llm.sandbox`): file writes are confined to the
+    workdir + scratch space, reads of the host's data tree and credential
+    stores are denied, network stays open for the model API.
 
     Auth + model routing are OpenCode's own (configure via ``opencode auth
     login`` / env). Token-level streaming is unavailable on this path; text
@@ -910,6 +926,16 @@ def opencode_chat_stream(
             raise RuntimeError(
                 f"Could not create opencode working directory {workdir!r}: {e}"
             ) from e
+
+    # Wrap in a macOS Seatbelt profile when hardened mode is requested and the
+    # host can enforce it; elsewhere (or without sandbox-exec) run unconfined.
+    profile_path = None
+    if hardened and sandbox.seatbelt_available():
+        try:
+            profile_path = sandbox.write_seatbelt_profile(workdir or ".")
+            args = ["sandbox-exec", "-f", profile_path] + args
+        except OSError:
+            profile_path = None  # degrade to unconfined rather than fail
 
     try:
         proc = subprocess.Popen(
@@ -980,6 +1006,8 @@ def opencode_chat_stream(
         except OSError:
             pass
         drainer.join(timeout=5)
+        if profile_path:
+            _unlink_quietly(profile_path)
 
     if proc.returncode not in (0, None):
         stderr_text = "".join(stderr_lines).strip()

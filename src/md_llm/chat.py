@@ -37,13 +37,14 @@ from __future__ import annotations
 import os
 import re
 import threading
-import time
 from datetime import datetime, timezone
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from . import llm
 from . import docs
+from . import sandbox
 from .autossh import _render_autossh_panel
 from .console import log_event
 from .controls import (
@@ -94,6 +95,27 @@ def _staged_quote_key():
     """Session key of the Reader quote staged for the ACTIVE session's chat."""
     doc = docs.active_document()
     return docs.chat_key(_READER_QUOTE, docs.active_chat(doc), doc)
+
+
+def _session_sandbox_dir():
+    """This chat session's OpenCode sandbox, created empty on first use.
+
+    Memoized per chat session via ``docs.chat_key``, so every turn of one
+    session reuses the same directory (files persist across its turns) while
+    every other session — even on the same document, running in parallel —
+    gets a distinct one. Directories abandoned by closed sessions/app restarts
+    are garbage-collected by age when a new sandbox is created; see
+    :mod:`md_llm.sandbox` for the isolation and clearing guarantees.
+    """
+    doc = docs.active_document()
+    sid = docs.active_chat(doc)
+    key = docs.chat_key("_opencode_sandbox", sid, doc)
+    path = st.session_state.get(key)
+    if not path:
+        stem = os.path.splitext(os.path.basename(doc))[0] if doc else "chat"
+        path = sandbox.new_session_sandbox(f"{stem}-s{sid}")
+        st.session_state[key] = path
+    return path
 
 
 def _resolve(path):
@@ -417,7 +439,14 @@ def _build_stream(context_path, holder):
             instruction=instruction,
         )
     elif provider == "OpenCode":
-        workdir = (st.session_state.get(f"{p}llm_opencode_workdir") or "").strip() or None
+        workdir = sandbox.normalize_workdir(
+            st.session_state.get(f"{p}llm_opencode_workdir")
+        )
+        hardened = bool(st.session_state.get(f"{p}llm_opencode_hardened", True))
+        if workdir is None:
+            # Managed mode: this session's own fresh sandbox (Seatbelt-confined
+            # when hardened), never the shared uploads folder.
+            workdir = _session_sandbox_dir()
         attach = (st.session_state.get(f"{p}llm_opencode_attach") or "").strip() or None
         agent = (st.session_state.get(f"{p}llm_opencode_agent") or "").strip() or None
         variant = _current_opencode_variant(p)
@@ -426,7 +455,8 @@ def _build_stream(context_path, holder):
         prompt = _turns_to_opencode_prompt(turns)
         gen = llm.opencode_chat_stream(
             prompt, model=model, workdir=workdir, attach=attach,
-            agent=agent, variant=variant, instruction=instruction,
+            agent=agent, variant=variant, hardened=hardened,
+            instruction=instruction,
         )
     else:
         endpoint = st.session_state.get(
@@ -464,6 +494,316 @@ def _stream_worker(task, stream, holder):
         task["error"] = holder["error"]
     task["text"] = (task.get("text") or "").strip()
     task["done"] = True
+
+
+@st.fragment(run_every=0.4)
+def _stream_partial_reply(task):
+    """Live-view an in-flight background stream, re-rendering only this bubble.
+
+    ``run_every`` polls the worker's shared ``task`` dict and re-runs just this
+    fragment — never the whole page. (The old full-page ``st.rerun`` poll
+    re-rendered the whole history every 0.4 s, and each rerun yanked the
+    viewport back to the bottom, making earlier turns unreadable mid-stream;
+    a fragment rerun leaves the rest of the page and the user's scroll
+    position untouched.)
+
+    Must NOT touch ``st.session_state`` or finalize the task: when the worker
+    sets ``done``, trigger a full app rerun and let ``render_chat`` fold the
+    finished reply in from the main script — which does so BEFORE rendering
+    any element, so the finalized conversation lands in a single frontend
+    commit (see ``_finalize_chat_task``).
+    """
+    if task.get("done"):
+        st.rerun(scope="app")
+    with st.chat_message("assistant"):
+        body = task.get("text") or ""
+        if body:
+            st.markdown(_escape_currency_dollars(body) + " ▌")
+        else:
+            st.caption(
+                "_working… (running in the background — switching tabs is "
+                "safe; the reply will appear here)_"
+            )
+
+
+def _finalize_chat_task(task):
+    """Fold a finished background stream's outcome into session state.
+
+    Called at the very TOP of ``render_chat`` — before any element renders —
+    so the finished reply joins the history that this same run then draws,
+    and the streaming bubble is swapped for the final message in ONE
+    frontend commit.
+
+    Why that ordering matters: Streamlit wraps the main view in a sticky
+    scroll-to-bottom container whenever an ``st.chat_input`` is mounted, and
+    that container re-asserts "scroll to the bottom" on every content-height
+    change. The old flow finalized MID-run (after the history loop had
+    already drawn) and then called ``st.rerun()``: commit 1 removed the
+    streaming bubble (the page shrank by the whole reply), commit 2 re-added
+    it as a history message (the page regrew). That shrink→regrow churn was
+    exactly what the sticky container rode to yank the viewport back down
+    the moment the LLM finished — even though the user had scrolled up to
+    read. Finalizing before the first element renders makes completion a
+    single, near-height-neutral commit, and dropping the extra ``st.rerun``
+    means the page (controls, sidebar, history) is not re-rendered twice.
+
+    ``task`` is the worker dict (``text``/``done``/``error``/``source``);
+    the caller pops the ``_CHAT_BG_TASK`` session key afterwards.
+    """
+    if task.get("error"):
+        st.session_state[_chat_state_key("_chat_last_error")] = task["error"]
+        log_event(f"Chat failed: {task['error']}", level="error",
+                  source=task.get("source", ""))
+        return
+    reply_text = (task.get("text") or "").strip()
+    st.session_state.setdefault(
+        _chat_state_key(_CHAT_MESSAGES), []
+    ).append({
+        "role": "assistant",
+        "content": reply_text
+        or "_(empty response — nothing came back.)_",
+    })
+    if reply_text:
+        log_event(f"Chat reply ({len(reply_text)} chars)",
+                  level="info", source=task.get("source", ""))
+    else:
+        log_event("Chat reply empty — nothing came back.",
+                  level="warn", source=task.get("source", ""))
+
+
+def _tame_chat_autoscroll():
+    """Stop Streamlit's sticky chat scroller from yanking the viewport down.
+
+    While any ``st.chat_input`` is mounted, Streamlit wraps the whole main
+    view in a "scroll-to-bottom" container (``useScrollToBottom`` /
+    ``useScrollAnimation`` in its frontend): whenever that container's
+    content height changes, the container re-asserts "scroll to the
+    bottom" — INCLUDING when the user has already scrolled up to read.
+    Unsticking is supposed to happen on a *user* scroll event, but the
+    hook classifies a scroll event as user-initiated only when the
+    container's ``scrollHeight``/``offsetHeight`` are unchanged since the
+    last handled event. Every content-height change around the user's
+    scroll (the finalize commit swapping the streaming bubble for the
+    final message, late layout shifts, the disabled→enabled input
+    transition) therefore misclassifies the user's wheel-up as a
+    "synthetic" Chrome resize-compensation event and re-arms the
+    auto-scroll — the viewport snaps back down the moment the LLM
+    finishes, exactly what the user reports. A 1px at-bottom threshold,
+    a 100ms scroll-event debouncer and an ignore-window after each
+    auto-scroll animation all widen that race window (verified against
+    Streamlit 1.58's frontend source and in a live browser).
+
+    The fix is deliberately surgical: the hook scrolls by *assigning*
+    ``container.scrollTop = value`` from a rAF loop; the browser's own
+    user-driven scrolling never goes through that property setter. So a
+    same-origin script (``components.html``, the same escape hatch
+    demo._preserve_reader_scroll and reader._inject_toc_jump use) defines
+    an own ``scrollTop`` accessor on the container that delegates reads
+    (measurements stay truthful) but gates writes on a *follow* flag:
+
+      * follow starts true — entering the chat view lands at the bottom,
+        and while the user watches, the streaming reply auto-scrolls.
+      * Physical user input that scrolls away from the bottom (wheel up,
+        touch drag up, scroll keys — never bare scroll events, which
+        Streamlit fires plenty of without the user) drops follow, and the
+        hook's yank writes are silently swallowed from then on.
+      * Reaching the bottom by user input, or submitting a new question
+        (Enter / send button), re-engages follow — submitting jumps to
+        the new question as chats do.
+
+    Layout is untouched (the CSS "move the scroller up a level" hack was
+    tried and scrolls away the app header).
+
+    Delivery detail, learned the hard way in a live browser: the shim
+    must NOT live inside the component iframe's own script. Streamlit
+    reloads the st.iframe in place on some full-app reruns — reliably at
+    the exact finalize rerun where the user starts scrolling away — and
+    the browser silently removes event listeners whose creating iframe
+    document was destroyed, which re-opened the yank window at the worst
+    moment. So the iframe is only a LOADER: it injects the real script
+    as a <script> element into the parent document, where the code, its
+    listeners and a MutationObserver live for the rest of the page's
+    lifetime (idempotent — repeated loads skip re-injecting). The
+    observer re-arms the gate whenever a fresh sticky container appears
+    (view switches recreate it); with no chat mounted the shim idles.
+
+    Must be called on EVERY chat render so the loader is present
+    whenever the chat view is mounted.
+    """
+    components.html(
+        """
+<script>
+// Loader: inject the chat-scroll shim into the PARENT document (top
+// realm) so it survives this iframe being reloaded/replaced.
+(function () {
+  try {
+    var w = window.parent;
+    var d = w.document;
+    if (w.__mdllm_chat_scroll_installed) return;
+    w.__mdllm_chat_scroll_installed = true;
+
+    var s = d.createElement('script');
+    // Template literal: the shim below is plain, readable JS — no
+    // string escaping layers (it contains no backticks or ${).
+    s.textContent = `
+(function () {
+  try {
+    var d = document;
+    var st = d.__mdllm_chat_scroll_state;
+    if (!st) { st = d.__mdllm_chat_scroll_state =
+               {follow: true, armed: false, el: null}; }
+
+    function find() {
+      return d.querySelector(
+          '[data-testid="stAppScrollToBottomContainer"]');
+    }
+    function atBottom(el) {
+      return el.scrollHeight - el.scrollTop - el.offsetHeight < 1;
+    }
+    // Bypass our own gate (used by the submit-jump below).
+    function rawSet(el, v) {
+      Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop')
+        .set.call(el, v);
+    }
+    function toBottom(el) {
+      rawSet(el, el.scrollHeight - el.offsetHeight);
+    }
+
+    // --- Gate scrollTop writes on the container -------------------
+    // follow is USER INTENT: reset only on a fresh chat-view mount
+    // (new container element) or by the user acting below.
+    function arm(el) {
+      if (st.el === el && st.armed) return;
+      if (st.el !== el) {
+        // Fresh container = the chat view (re)mounted: follow anew,
+        // and let Streamlit's native first-load scroll-to-bottom pass.
+        st.follow = true;
+      }
+      var desc = Object.getOwnPropertyDescriptor(
+          Element.prototype, 'scrollTop');
+      Object.defineProperty(el, 'scrollTop', {
+        configurable: true,
+        get: function () { return desc.get.call(el); },
+        set: function (v) {
+          if (st.follow) desc.set.call(el, v);
+          // else: swallow — Streamlit's sticky-scroll may not move
+          // the viewport. Its animation converges in value space and
+          // ends on its own; only its writes are dropped.
+        },
+      });
+      st.el = el;
+      st.armed = true;
+    }
+
+    function check() {
+      var el = find();
+      if (el && st.el !== el) arm(el);
+    }
+    check();
+    new MutationObserver(check).observe(
+        d.body, {childList: true, subtree: true});
+
+    // --- Real-user-input detection --------------------------------
+    // Follow must ONLY be dropped by physical input. Scroll *events*
+    // alone never count: Streamlit auto-scrolls fire them without any
+    // user action, and inferring "the user scrolled" from them is
+    // exactly the misclassification this shim exists to correct.
+    // Handlers only react to input aimed at the armed chat container,
+    // so scrolling another panel (sidebar, a mounted Reader) never
+    // changes the chat's follow state.
+    function inChat(e) {
+      var s = d.__mdllm_chat_scroll_state;
+      return !!(s && s.el && s.el.isConnected
+                && e.target && e.target.nodeType === 1
+                && s.el.contains(e.target));
+    }
+
+    function onWheel(e) {
+      if (!inChat(e)) return;
+      var s = d.__mdllm_chat_scroll_state;
+      if (e.deltaY < 0) {
+        s.follow = false;              // scrolling up: stop following
+      } else if (e.deltaY > 0) {
+        var el = s.el;
+        setTimeout(function () {        // re-stick only if it lands at
+          if (el.isConnected && atBottom(el)) s.follow = true;
+        }, 80);
+      }
+    }
+
+    var touchY = null;
+    function onTouchStart(e) {
+      if (!inChat(e)) return;
+      touchY = e.touches.length ? e.touches[0].clientY : null;
+    }
+    function onTouchMove(e) {
+      if (!inChat(e) || !e.touches.length) return;
+      var y = e.touches[0].clientY;
+      if (typeof touchY === 'number' && y < touchY - 4) {
+        d.__mdllm_chat_scroll_state.follow = false;  // drag up: stop
+      }
+      touchY = y;
+    }
+
+    function onKey(e) {
+      if (!inChat(e)) return;
+      var s = d.__mdllm_chat_scroll_state;
+      var k = e.key;
+      var up = (k === 'ArrowUp' || k === 'PageUp' || k === 'Home'
+                || (k === ' ' && e.shiftKey));
+      var down = (k === 'ArrowDown' || k === 'PageDown' || k === 'End'
+                  || (k === ' ' && !e.shiftKey));
+      if (up) s.follow = false;
+      if (down) {
+        var el = s.el;
+        setTimeout(function () {
+          if (el.isConnected && atBottom(el)) s.follow = true;
+        }, 80);
+      }
+
+      // Submitting a new question: re-engage and jump to it — the
+      // user just typed at the bottom; the question and the working
+      // indicator must come into view (the hook only auto-scrolls
+      // when IT still considers itself sticky, which is unreliable).
+      if (k === 'Enter' && !e.shiftKey) {
+        var t = e.target;
+        if (t && t.closest
+            && t.closest('[data-testid="stChatInputTextArea"]')) {
+          s.follow = true;
+          if (s.el) toBottom(s.el);
+        }
+      }
+    }
+
+    function onPointer(e) {
+      if (!inChat(e)) return;
+      var t = e.target;
+      if (t && t.closest
+          && t.closest('[data-testid="stBottom"] button')) {
+        var s = d.__mdllm_chat_scroll_state;
+        s.follow = true;
+        if (s.el) toBottom(s.el);
+      }
+    }
+
+    d.addEventListener('wheel', onWheel, {capture: true, passive: true});
+    d.addEventListener('touchstart', onTouchStart,
+                       {capture: true, passive: true});
+    d.addEventListener('touchmove', onTouchMove,
+                       {capture: true, passive: true});
+    d.addEventListener('keydown', onKey, {capture: true, passive: true});
+    d.addEventListener('pointerdown', onPointer,
+                       {capture: true, passive: true});
+  } catch (e) {}
+})();
+`;
+    (d.head || d.documentElement).appendChild(s);
+  } catch (e) {}
+})();
+</script>
+""",
+        height=0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +877,19 @@ def render_chat():
     The chat always targets whatever document is open in the Reader — open one
     there, then ask about it here. There is no separate dropdown.
     """
+    # --- Finalize a finished background task BEFORE anything renders ----
+    # The reply must join _CHAT_MESSAGES ahead of the history loop below so
+    # this same run draws the complete conversation — one frontend commit,
+    # no intermediate bubble-removed state, no second rerun. See
+    # _finalize_chat_task for why that single-commit property is what keeps
+    # Streamlit's sticky scroll-to-bottom container from yanking the
+    # viewport down the moment the LLM finishes.
+    _task = st.session_state.get(_chat_state_key(_CHAT_BG_TASK))
+    if _task and _task.get("done"):
+        _finalize_chat_task(_task)
+        st.session_state.pop(_chat_state_key(_CHAT_BG_TASK), None)
+        _task = None
+
     st.subheader("LLM chat")
 
     # --- Chat sessions for this document -------------------------------
@@ -561,7 +914,6 @@ def render_chat():
                 key=f"_md_llm_chat_btn_{sid}_{_doc}",
                 type="primary" if sid == cur else "secondary",
                 use_container_width=True,
-                help="Switch to this chat session.",
             ):
                 if sid != cur:
                     docs.set_active_chat(sid, _doc)
@@ -570,16 +922,12 @@ def render_chat():
     # "+ New" opens another independent conversation; "Close" drops the
     # current session (never the last remaining one).
     col_new, col_close, _ = st.columns([1, 1, 3])
-    if col_new.button(
-        "+ New",
-        help="Open another independent chat session for this document.",
-    ):
+    if col_new.button("+ New"):
         docs.add_chat(_doc)
         st.rerun()
     if col_close.button(
         "Close",
         disabled=len(sessions) <= 1,
-        help="Close this chat session and drop its conversation.",
     ):
         docs.remove_chat(cur, _doc)
         st.rerun()
@@ -642,8 +990,7 @@ def render_chat():
             f"**Quote attached to your next question** (alongside the full "
             f"document):\n\n> {staged_quote}"
         )
-        if st.button("Drop quote", help="Don't attach the staged passage to "
-                     "the next question after all."):
+        if st.button("Drop quote"):
             st.session_state.pop(_staged_quote_key(), None)
             st.rerun()
 
@@ -665,17 +1012,14 @@ def render_chat():
     _snapshot_chat_controls()
 
     col_save, col_clear, _ = st.columns([1, 1, 2])
-    if col_save.button(
-        "Save conversation", help="Save this chat as a .md in the configured "
-        "save dir, with the source document embedded for context.",
-    ):
+    if col_save.button("Save conversation"):
         provider = st.session_state.get("chat_llm_provider", "OpenRouter")
         model = _current_llm_model(prefix="chat_") or "(none)"
         saved = _save_conversation(context_path, provider, model)
         if saved:
             st.success(f"Saved: `{os.path.basename(saved)}`")
             st.rerun()
-    if col_clear.button("Clear conversation", help="Reset the chat history."):
+    if col_clear.button("Clear conversation"):
         st.session_state.pop(_chat_state_key(_CHAT_MESSAGES), None)
         st.session_state.pop(_chat_state_key(_CHAT_BG_TASK), None)
         st.rerun()
@@ -685,6 +1029,12 @@ def render_chat():
     # Permanently bump body-text + code font size (scoped to Streamlit's
     # markdown/code containers; chat-message bodies use the same containers).
     st.markdown(_BODY_FONT_SIZE_CSS, unsafe_allow_html=True)
+
+    # Gate Streamlit's sticky scroll-to-bottom container so it follows the
+    # stream while the user is at the bottom but can never yank the viewport
+    # back down after they scroll away (see _tame_chat_autoscroll). Mounted
+    # on every chat render so it re-arms whenever the chat view remounts.
+    _tame_chat_autoscroll()
 
     # --- Chat history --------------------------------------------------
     messages = st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or []
@@ -701,45 +1051,26 @@ def render_chat():
     # --- Background streaming task (survives tab switches) -------------
     # The LLM call runs in a daemon thread (_stream_worker), so switching to
     # the Reader mid-reply no longer cancels it — the call (and OpenCode's
-    # subprocess) keeps running at the back end. Here we finalize once when
-    # done, and otherwise stream the partial reply + poll.
-    task = st.session_state.get(_chat_state_key(_CHAT_BG_TASK))
-    if task:
-        if task.get("done"):
-            if task.get("error"):
-                st.session_state[_chat_state_key("_chat_last_error")] = task["error"]
-                log_event(f"Chat failed: {task['error']}", level="error",
-                          source=task.get("source", ""))
-            else:
-                reply_text = (task.get("text") or "").strip()
-                st.session_state.setdefault(
-                    _chat_state_key(_CHAT_MESSAGES), []
-                ).append({
-                    "role": "assistant",
-                    "content": reply_text
-                    or "_(empty response — nothing came back.)_",
-                })
-                if reply_text:
-                    log_event(f"Chat reply ({len(reply_text)} chars)",
-                              level="info", source=task.get("source", ""))
-                else:
-                    log_event("Chat reply empty — nothing came back.",
-                              level="warn", source=task.get("source", ""))
-            st.session_state.pop(_chat_state_key(_CHAT_BG_TASK), None)
-            st.rerun()
-        # Still running: show the partial reply and poll. The work continues in
-        # the background thread regardless of which tab is active.
-        with st.chat_message("assistant"):
-            body = task.get("text") or ""
-            if body:
-                st.markdown(_escape_currency_dollars(body) + " ▌")
-            else:
-                st.caption(
-                    "_working… (running in the background — switching tabs is "
-                    "safe; the reply will appear here)_"
-                )
-        time.sleep(0.4)
-        st.rerun()
+    # subprocess) keeps running at the back end. A finished task was already
+    # folded in at the top of this run (see _finalize_chat_task); only the
+    # still-running case remains here.
+    if _task:
+        # Still running: the fragment renders/polls the partial reply. The
+        # work continues in the background thread regardless of which tab
+        # is active.
+        _stream_partial_reply(_task)
+
+        # The chat input stays mounted while a reply streams (disabled).
+        # Streamlit wraps the whole main view in a sticky scroll-to-bottom
+        # container whenever an st.chat_input is present, and every fresh
+        # mount of that container force-scrolls the page to the bottom — so
+        # unmounting the input mid-stream (the old early `return`) yanked
+        # the viewport down at the remount when the stream finished. The
+        # input's element id does NOT depend on `disabled`, so keeping it
+        # mounted lets the container — and the user's scroll position —
+        # survive the whole stream→done transition untouched.
+        st.chat_input("Ask about this document…", disabled=True)
+        return
 
     # --- Input ---------------------------------------------------------
     prompt = st.chat_input("Ask about this document…")
@@ -766,8 +1097,8 @@ def render_chat():
             # subprocess it drives, e.g. `opencode run`) keeps running when the
             # user switches tabs or switches to another open document's chat.
             # st.write_stream would be cancelled by the tab-switch rerun, and
-            # the stream's generator kills its subprocess on close. The poll
-            # block above drains `task` for live display.
+            # the stream's generator kills its subprocess on close. The
+            # polling fragment above drains `task` for live display.
             task = {"text": "", "done": False, "error": None, "source": chat_src}
             worker = threading.Thread(
                 target=_stream_worker, args=(task, stream, holder),

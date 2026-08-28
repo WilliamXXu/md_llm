@@ -96,6 +96,10 @@ with st.sidebar:
   state and activates the next open document. Closing the last one — or
   calling `open_in_reader(rel)` without `keep_open` — returns the session to
   single-document mode and its legacy keys.
+- The same file is never open twice: re-opening an already-open path just
+  re-activates it (keeping its conversation), and a different path to the
+  same file (`./notes.md` vs `notes.md`, an absolute path, a symlink) is
+  refused with a warning dialog that activates the existing copy instead.
 
 ### Optional: several independent chat sessions per document
 

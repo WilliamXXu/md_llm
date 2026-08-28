@@ -30,7 +30,9 @@ import os
 
 import streamlit as st
 
+from . import docs
 from . import llm
+from . import sandbox
 from .core import get_core
 
 
@@ -341,17 +343,24 @@ def _current_opencode_variant(prefix=""):
     return None
 
 
+# The OpenCode "clear sandbox" button's session-state key. It deliberately does
+# NOT follow the {prefix}llm_* naming convention: the chat panel snapshots every
+# chat_* key and re-seeds it before the controls mount, and Streamlit forbids
+# injecting session_state for BUTTON keys (StreamlitValueAssignmentNotAllowed-
+# Error). A leading "_" keeps it outside all snapshot prefixes.
+OPENCODE_CLEAR_SANDBOX_KEY = "_opencode_clear_sandbox"
+
+
 def _render_opencode_controls(prefix, saved_llm):
-    """Render the OpenCode provider's model / workdir / attach / agent controls.
+    """Render the OpenCode provider's model / sandbox / attach / agent controls.
 
     Models are merged from ``opencode models`` (cached) and the user's
-    previously-used list. The working directory defaults to a sandbox subdir of
-    the host base dir so the agent's bash/edit tools stay scoped by default;
-    the user can override it to point at a real project.
+    previously-used list. By default the agent runs in a hardened per-chat
+    sandbox (:mod:`md_llm.sandbox`): a fresh, Seatbelt-confined directory that
+    no other session can see. The user may override the workdir to point at a
+    real project; the confinement toggle still applies.
     """
     p = prefix
-    base_dir = get_core().base_dir
-    sandbox_default = os.path.join(base_dir, ".opencode-sandbox")
 
     discovered = _opencode_cached_models()
     history = [
@@ -380,10 +389,8 @@ def _render_opencode_controls(prefix, saved_llm):
         "Model (provider/model)",
         options,
         key=f"{p}llm_opencode_model_sel",
-        help="Models from `opencode models` + your previously-used ones. "
-             "Pick \"(other — type below)\" to type a new one.",
     )
-    if scol2.button("Refresh", help="Re-run `opencode models` to refresh the list."):
+    if scol2.button("Refresh"):
         st.session_state.pop("_opencode_models_cache", None)
         st.rerun()
     if st.session_state.get(f"{p}llm_opencode_model_sel") == "(other — type below)":
@@ -391,7 +398,6 @@ def _render_opencode_controls(prefix, saved_llm):
             "Custom model name",
             value=saved_llm.get(f"{p}llm_opencode_model", ""),
             key=f"{p}llm_opencode_model",
-            help="e.g. anthropic/claude-sonnet-420, openai/gpt-4o-mini",
         )
 
     variant_options = ["(none)"] + list(llm.OPENCODE_VARIANTS) + ["(other — type below)"]
@@ -399,39 +405,57 @@ def _render_opencode_controls(prefix, saved_llm):
         "Model variant",
         variant_options,
         key=f"{p}llm_opencode_variant_sel",
-        help="Provider-specific reasoning effort, forwarded to "
-             "`opencode run --variant`. Pick \"(none)\" to omit it; supported "
-             "values depend on the model's provider (e.g. high, max, minimal).",
     )
     if st.session_state.get(f"{p}llm_opencode_variant_sel") == "(other — type below)":
         st.text_input(
             "Custom variant",
             value=saved_llm.get(f"{p}llm_opencode_variant", ""),
             key=f"{p}llm_opencode_variant",
-            help="e.g. high, max, minimal (provider-specific).",
         )
 
-    st.text_input(
-        "Working directory",
-        value=saved_llm.get(f"{p}llm_opencode_workdir", sandbox_default),
-        key=f"{p}llm_opencode_workdir",
-        help="The agent runs bash/read/edit inside this directory. Defaults to "
-             "a sandbox subdir of the host base dir; point it at a project to "
-             "let the agent operate there.",
+    st.checkbox(
+        "Hardened sandbox (Seatbelt)",
+        value=saved_llm.get(f"{p}llm_opencode_hardened", True),
+        key=f"{p}llm_opencode_hardened",
+        help=(
+            "Run the agent under a macOS Seatbelt profile: writes are confined "
+            "to the working directory plus scratch space, and reads of this "
+            "app's data folder (uploads, chats, settings) and of credential "
+            "stores (~/.ssh, ~/.gnupg, ...) are blocked. Network stays open "
+            "for the model API."
+        ),
     )
+    st.text_input(
+        "Working directory (optional override)",
+        value=saved_llm.get(f"{p}llm_opencode_workdir", ""),
+        key=f"{p}llm_opencode_workdir",
+        placeholder="fresh per-chat sandbox (recommended)",
+        help=(
+            "Leave empty to give each chat session its own fresh sandbox "
+            "directory — cleared before use, garbage-collected after. Enter a "
+            "path to pin a real project directory instead; it is never wiped "
+            "automatically. The legacy default (.opencode-sandbox inside the "
+            "data folder) now also means managed mode."
+        ),
+    )
+    if st.button("Clear this chat's sandbox", key=OPENCODE_CLEAR_SANDBOX_KEY):
+        doc = docs.active_document()
+        sb_key = docs.chat_key("_opencode_sandbox", docs.active_chat(doc), doc)
+        path = st.session_state.pop(sb_key, None)
+        if path and sandbox.clear_sandbox(path):
+            st.toast("Sandbox directory deleted.", icon="🧹")
+        else:
+            st.caption("No active sandbox yet — it is created on first send.")
     st.text_input(
         "Attach to server (optional)",
         value=saved_llm.get(f"{p}llm_opencode_attach", ""),
         key=f"{p}llm_opencode_attach",
         placeholder="e.g. http://localhost:4096",
-        help="Attach to a running `opencode serve` instance to avoid the "
-             "per-message cold start. Leave empty to spawn a fresh `opencode run`.",
     )
     st.text_input(
         "Agent (optional)",
         value=saved_llm.get(f"{p}llm_opencode_agent", ""),
         key=f"{p}llm_opencode_agent",
-        help="Restrict to a specific opencode agent (see `opencode agent list`).",
     )
     st.caption(
         "_OpenCode runs as a full agent with `--auto` (tools auto-approved in "
@@ -523,9 +547,6 @@ def _render_oai_controls(prefix, saved_llm):
         options,
         key=endpoint_key,
         on_change=_on_oai_endpoint_change, args=(prefix,),
-        help="Previously used endpoints are remembered here. Pick "
-             "\"(other — type below)\" to type a new one. Models and the API key "
-             "are remembered per endpoint, so switching here restores them.",
     )
 
     if st.session_state.get(endpoint_key) == "(other — type below)":
@@ -534,10 +555,6 @@ def _render_oai_controls(prefix, saved_llm):
             value=saved_llm.get(endpoint_custom_key, ""),
             key=endpoint_custom_key,
             on_change=_on_oai_endpoint_change, args=(prefix,),
-            help="Any OpenAI-compatible base URL. e.g. "
-                 "https://api.openai.com/v1, "
-                 "https://api.groq.com/openai/v1, "
-                 "https://api.together.xyz/v1",
         )
 
     # Models are scoped per-endpoint: only models actually used with THIS
@@ -561,16 +578,12 @@ def _render_oai_controls(prefix, saved_llm):
         "Model",
         options,
         key=f"{p}llm_oai_model_sel",
-        help="Previously used models for this endpoint are remembered here. "
-             "Pick \"(other — type below)\" to type a new one.",
     )
     if st.session_state.get(f"{p}llm_oai_model_sel") == "(other — type below)":
         st.text_input(
             "Custom model name",
             value=saved_llm.get(f"{p}llm_oai_model", ""),
             key=f"{p}llm_oai_model",
-            help="e.g. gpt-4o-mini, qwen/qwen3-32b, "
-                 "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         )
     _oai_key_ph = (
         "Using OPENAI_API_KEY from env (paste to override)"
@@ -582,8 +595,6 @@ def _render_oai_controls(prefix, saved_llm):
         type="password",
         key=f"{p}llm_oai_api_key",
         placeholder=_oai_key_ph,
-        help="Remembered per endpoint. Leave empty to fall back to the "
-             "OPENAI_API_KEY env var.",
     )
 
 
@@ -641,16 +652,12 @@ def _render_llm_controls(prefix="", show_instruction=True):
             "Model",
             options,
             key=f"{p}llm_or_model_sel",
-            help="Previously used models are remembered here. Pick "
-                 "\"(other — type below)\" to type a new one.",
         )
         if st.session_state.get(f"{p}llm_or_model_sel") == "(other — type below)":
             st.text_input(
                 "Custom model name",
                 value=saved_llm.get(f"{p}llm_or_model", ""),
                 key=f"{p}llm_or_model",
-                help="e.g. openai/gpt-4o-mini, anthropic/claude-3.5-sonnet, "
-                     "google/gemini-2.0-flash",
             )
         _or_key_ph = (
             "Using OPENROUTER_API_KEY from env (paste to override)"
@@ -662,8 +669,6 @@ def _render_llm_controls(prefix="", show_instruction=True):
             type="password",
             key=f"{p}llm_or_api_key",
             placeholder=_or_key_ph,
-            help="Write-only: the key is never echoed back. "
-                 "Leave empty to use the OPENROUTER_API_KEY env var.",
         )
 
     if show_instruction:

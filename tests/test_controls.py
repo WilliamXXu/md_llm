@@ -9,7 +9,6 @@ Ported from transcriber_system's test_llm_openai.py (the OaiRegistry* classes),
 retargeted at md_llm.controls.
 """
 
-import os
 import tempfile
 import unittest
 

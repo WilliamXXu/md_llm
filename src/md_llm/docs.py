@@ -11,6 +11,10 @@ with ``open_in_reader(relpath, keep_open=True)`` (or calling
     background stream task (``_chat_bg_task``), last chat error, and staged
     Reader quote — namespaced via :func:`doc_key` as
     ``<base>__doc__<relpath>`` so nothing leaks across documents;
+  * a file can be open at most once — :func:`add_document` refuses a second
+    copy of an already-open file (a different relpath resolving to it, e.g.
+    ``./notes.md`` vs ``notes.md``), activates the existing document, and
+    pops a warning dialog (:func:`_warn_already_open`);
   * the **active** document decides what the Reader shows and which
     conversation the chat tab operates on;
   * :func:`render_doc_selector` / :func:`render_doc_buttons` render the
@@ -147,15 +151,59 @@ def activate_no_document():
     st.session_state.pop("_reader_target", None)
 
 
+def _doc_identity(rel):
+    """Hashable identity of the file behind ``rel`` (duplicate detection).
+
+    An existing file is identified by its ``(st_dev, st_ino)`` pair, so the
+    same file reached through any relpath (``./notes.md``, an absolute path,
+    a symlink, …) collides while different files never do. A missing file
+    falls back to its normalized absolute path; without an injected Core
+    (unit tests) the raw string is normalized instead.
+    """
+    try:
+        base = os.path.abspath(get_core().base_dir)
+    except RuntimeError:
+        return ("raw", os.path.normpath(rel))
+    full = os.path.abspath(os.path.join(base, rel))
+    try:
+        st_ = os.stat(full)
+    except OSError:
+        return ("path", os.path.realpath(full))
+    return ("ino", st_.st_dev, st_.st_ino)
+
+
+def _find_duplicate_document(rel):
+    """Relpath of an already-open document that IS the file behind ``rel``.
+
+    None when ``rel`` isn't already open — including the exact-match case
+    (``rel`` itself in the registry), which is :func:`add_document`'s
+    documented idempotent re-open, not a duplicate.
+    """
+    ident = _doc_identity(rel)
+    for other in open_documents():
+        if other != rel and _doc_identity(other) == ident:
+            return other
+    return None
+
+
 def add_document(rel):
     """Register ``rel`` as an open document and make it the active one.
 
     Returns the doc id (``rel``, or "" when falsy). Idempotent: re-opening an
-    already-open file keeps its position and its existing conversation.
+    already-open file keeps its position and its existing conversation. A
+    DIFFERENT relpath resolving to an already-open file (``./notes.md`` vs
+    ``notes.md``, an absolute path, a symlink) is refused: no second copy is
+    registered — the existing document is activated and the warning dialog
+    :func:`_warn_already_open` explains why.
     """
     if not rel:
         return ""
     st.session_state.pop(_NO_DOC_ACTIVE, None)  # leaving no-doc context
+    dup = _find_duplicate_document(rel)
+    if dup is not None:
+        set_active_document(dup)
+        _warn_already_open(dup)
+        return dup
     reg = st.session_state.get(_OPEN_DOCS)
     if not isinstance(reg, dict):
         reg = {}
@@ -439,6 +487,61 @@ def _doc_display_name(rel):
     return name
 
 
+def doc_chat_has_messages(rel):
+    """True when any chat session of ``rel`` holds at least one message.
+
+    Used by :func:`close_document` to warn before a close wipes a
+    conversation. The message base key is shared with chat.py by literal
+    string (the same convention ``_reader_quote`` uses).
+    """
+    for sid in chat_sessions(rel):
+        if st.session_state.get(chat_key("_chat_messages", sid, rel)):
+            return True
+    return False
+
+
+@st.dialog("Document already open")
+def _warn_already_open(rel):
+    """Modal warning that a second copy of an open file was refused."""
+    st.warning(
+        f"**{_doc_display_name(rel)}** is already open — a document can't be "
+        "opened twice. The existing copy is now active."
+    )
+    if st.button("OK", type="primary"):
+        st.rerun()
+
+
+@st.dialog("Non-empty LLM chat")
+def _confirm_close_document(rel):
+    """Modal asking to proceed with closing a non-empty chat document."""
+    st.warning(
+        f"Do you want to proceed with a non-empty LLM chat?\n\n"
+        f"Closing **{_doc_display_name(rel)}** removes its conversation "
+        "from the session."
+    )
+    col_proceed, col_cancel = st.columns(2)
+    if col_proceed.button("Close anyway", type="primary"):
+        remove_document(rel)
+        st.rerun()
+    if col_cancel.button("Cancel"):
+        st.rerun()
+
+
+def close_document(rel):
+    """Close ``rel`` from a button click, guarding a non-empty chat.
+
+    With any chat session of the document holding messages, a confirmation
+    dialog (:func:`_confirm_close_document`) runs first and the document is
+    only closed when the user proceeds; otherwise the document closes
+    immediately, exactly like ``remove_document`` + rerun before.
+    """
+    if doc_chat_has_messages(rel):
+        _confirm_close_document(rel)
+        return
+    remove_document(rel)
+    st.rerun()
+
+
 def render_doc_selector():
     """Sidebar picker over the open documents; no-op in single-document mode.
 
@@ -477,21 +580,14 @@ def render_doc_selector():
         format_func=_doc_display_name,
         key=_DOC_SELECT,
         label_visibility="collapsed",
-        help="Each open document keeps its own LLM chat. Switch here to read "
-             "and chat with another document.",
     )
     st.session_state[_DOC_SELECT_LAST] = cur
     if sel != cur:
         set_active_document(sel)
         st.rerun()
 
-    if st.button(
-        "Close active",
-        help="Close this document and its chat. Its conversation is removed "
-             "from the session.",
-    ):
-        remove_document(sel)
-        st.rerun()
+    if st.button("Close active"):
+        close_document(sel)
 
 
 def render_doc_buttons():
@@ -520,8 +616,6 @@ def render_doc_buttons():
         key="_md_llm_doc_btn_none",
         type="primary" if no_doc or not cur else "secondary",
         use_container_width=True,
-        help="Use the LLM chat without any markdown context. This entry is "
-             "always available and can't be closed.",
     ):
         activate_no_document()
         st.session_state["_app_tabs"] = "LLM chat"
@@ -530,7 +624,6 @@ def render_doc_buttons():
         "✕",
         key="_md_llm_doc_close_none",
         disabled=True,
-        help="The no-document placeholder can't be closed.",
     )
 
     # --- One switch + close row per open document -------------------------
@@ -541,8 +634,6 @@ def render_doc_buttons():
             key=f"_md_llm_doc_btn_{rel}",
             type="primary" if rel == cur and not no_doc else "secondary",
             use_container_width=True,
-            help="Make this the active document and show it in the Reader. "
-                 "Each document keeps its own chat.",
         ):
             set_active_document(rel)
             # Literal strings, same convention as the "_reader_target" write
@@ -552,8 +643,5 @@ def render_doc_buttons():
         if col_close.button(
             "✕",
             key=f"_md_llm_doc_close_{rel}",
-            help="Close this document and its chat. Its conversation is "
-                 "removed from the session.",
         ):
-            remove_document(rel)
-            st.rerun()
+            close_document(rel)

@@ -312,6 +312,49 @@ class OpencodeChatStreamTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(llm.opencode_chat_stream("", model="m"))
 
+    def test_hardened_wraps_argv_in_sandbox_exec_and_cleans_profile(self):
+        captured, fake = self._capture(
+            [json.dumps({"type": "text", "part": {"text": "ok"}})]
+        )
+        profile = "/tmp/md_llm_test_fake.sb"
+        with mock.patch("subprocess.Popen", side_effect=fake), \
+             mock.patch.object(
+                 llm.sandbox, "seatbelt_available", return_value=True), \
+             mock.patch.object(
+                 llm.sandbox, "write_seatbelt_profile",
+                 side_effect=lambda wd: profile), \
+             mock.patch.object(llm, "_unlink_quietly") as m_unlink:
+            list(llm.opencode_chat_stream("hi", model="m", workdir="/tmp/s",
+                                          hardened=True))
+        a = captured["args"]
+        self.assertEqual(a[0], "sandbox-exec")
+        self.assertEqual(a[1], "-f")
+        self.assertEqual(a[2], profile)
+        self.assertEqual(a[3], "opencode")
+        self.assertEqual(a[a.index("--dir") + 1], "/tmp/s")
+        # The temp profile is deleted once the stream ends.
+        m_unlink.assert_called_once_with(profile)
+
+    def test_not_hardened_keeps_plain_argv(self):
+        captured, fake = self._capture(
+            [json.dumps({"type": "text", "part": {"text": "ok"}})]
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake), \
+             mock.patch.object(
+                 llm.sandbox, "seatbelt_available", return_value=True):
+            list(llm.opencode_chat_stream("hi", model="m", hardened=False))
+        self.assertEqual(captured["args"][0], "opencode")
+
+    def test_hardened_without_seatbelt_degrades_to_plain_argv(self):
+        captured, fake = self._capture(
+            [json.dumps({"type": "text", "part": {"text": "ok"}})]
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake), \
+             mock.patch.object(
+                 llm.sandbox, "seatbelt_available", return_value=False):
+            list(llm.opencode_chat_stream("hi", model="m", hardened=True))
+        self.assertEqual(captured["args"][0], "opencode")
+
 
 if __name__ == "__main__":
     unittest.main()

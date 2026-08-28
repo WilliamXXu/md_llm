@@ -8,6 +8,9 @@ the last document returns to single-document mode. These exercise the registry
 and the key-namespacing logic directly.
 """
 
+import os
+import shutil
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -151,6 +154,105 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(st.session_state[docs._ACTIVE_DOC], "a.md")
 
 
+class DuplicateDocumentTests(unittest.TestCase):
+    """add_document() refuses a SECOND copy of an already-open file — whether
+    via a differently-spelled relpath, an absolute path, or a symlink — and
+    warns via the _warn_already_open dialog while activating the existing
+    document. The exact-same relpath stays the documented idempotent re-open
+    (no warning)."""
+
+    def setUp(self):
+        _clear_doc_state()
+        self._tmp = tempfile.mkdtemp(prefix="mdllm_dup_")
+        with open(os.path.join(self._tmp, "a.md"), "w") as f:
+            f.write("# a")
+        with open(os.path.join(self._tmp, "b.md"), "w") as f:
+            f.write("# b")
+        _reset_for_tests(Core(
+            base_dir=self._tmp,
+            markdown_dirs=(self._tmp,),
+            chat_save_dir=self._tmp,
+        ))
+
+    def tearDown(self):
+        _clear_doc_state()
+        _reset_for_tests()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_reopen_same_string_is_idempotent_without_warning(self):
+        with patch("md_llm.docs._warn_already_open") as warn:
+            docs.add_document("a.md")
+            docs.add_document("a.md")
+        warn.assert_not_called()
+        self.assertEqual(docs.open_documents(), ["a.md"])
+        self.assertEqual(docs.active_document(), "a.md")
+
+    def test_same_file_via_dot_slash_is_refused_with_warning(self):
+        docs.add_document("a.md")
+        with patch("md_llm.docs._warn_already_open") as warn:
+            ret = docs.add_document("./a.md")
+        warn.assert_called_once_with("a.md")
+        self.assertEqual(ret, "a.md")
+        self.assertEqual(docs.open_documents(), ["a.md"])
+        self.assertEqual(docs.active_document(), "a.md")
+        self.assertEqual(st.session_state["_reader_target"], "a.md")
+
+    def test_same_file_via_absolute_path_is_refused(self):
+        docs.add_document("a.md")
+        with patch("md_llm.docs._warn_already_open") as warn:
+            docs.add_document(os.path.join(self._tmp, "a.md"))
+        warn.assert_called_once_with("a.md")
+        self.assertEqual(docs.open_documents(), ["a.md"])
+
+    def test_same_file_via_symlink_is_refused(self):
+        link = os.path.join(self._tmp, "link.md")
+        try:
+            os.symlink(os.path.join(self._tmp, "a.md"), link)
+        except OSError:
+            self.skipTest("symlinks unavailable on this platform")
+        docs.add_document("a.md")
+        with patch("md_llm.docs._warn_already_open") as warn:
+            docs.add_document("link.md")
+        warn.assert_called_once_with("a.md")
+        self.assertEqual(docs.open_documents(), ["a.md"])
+
+    def test_distinct_files_both_open_without_warning(self):
+        with patch("md_llm.docs._warn_already_open") as warn:
+            docs.add_document("a.md")
+            docs.add_document("b.md")
+        warn.assert_not_called()
+        self.assertEqual(docs.open_documents(), ["a.md", "b.md"])
+
+    def test_refused_copy_never_touches_a_second_conversation(self):
+        docs.add_document("a.md")
+        st.session_state["_chat_messages__doc__a.md"] = [
+            {"role": "user", "content": "hi"},
+        ]
+        with patch("md_llm.docs._warn_already_open"):
+            docs.add_document("./a.md")
+        self.assertNotIn("_chat_messages__doc__./a.md", st.session_state)
+        self.assertEqual(
+            st.session_state["_chat_messages__doc__a.md"][0]["content"], "hi",
+        )
+
+    def test_missing_file_deduped_by_normalized_path(self):
+        with patch("md_llm.docs._warn_already_open") as warn:
+            docs.add_document("ghost.md")
+            docs.add_document("./ghost.md")
+        warn.assert_called_once_with("ghost.md")
+        self.assertEqual(docs.open_documents(), ["ghost.md"])
+
+    def test_string_normalization_fallback_without_core(self):
+        # Without an injected Core the identity falls back to normpath of the
+        # raw string — the duplicate guard still holds for spelling variants.
+        _reset_for_tests()
+        with patch("md_llm.docs._warn_already_open") as warn:
+            docs.add_document("a.md")
+            docs.add_document("./a.md")
+        warn.assert_called_once_with("a.md")
+        self.assertEqual(docs.open_documents(), ["a.md"])
+
+
 class ChatSessionKeyTests(unittest.TestCase):
     """chat_key(): session-1 keys are the legacy doc keys; 2+ are namespaced."""
 
@@ -283,6 +385,60 @@ class ChatSessionRegistryTests(unittest.TestCase):
         self.assertNotIn(docs._chat_sessions_key("a.md"), st.session_state)
         self.assertNotIn(docs._chat_active_key("a.md"), st.session_state)
         self.assertNotIn("_chat_messages__chat__2__doc__a.md", st.session_state)
+
+
+class CloseGuardTests(unittest.TestCase):
+    def setUp(self):
+        _clear_doc_state()
+
+    def tearDown(self):
+        _clear_doc_state()
+
+    def test_empty_chat_has_no_messages(self):
+        docs.add_document("a.md")
+        self.assertFalse(docs.doc_chat_has_messages("a.md"))
+
+    def test_session_one_messages_count(self):
+        docs.add_document("a.md")
+        st.session_state["_chat_messages__doc__a.md"] = [{"role": "user"}]
+        self.assertTrue(docs.doc_chat_has_messages("a.md"))
+
+    def test_extra_session_messages_count(self):
+        docs.add_document("a.md")
+        docs.add_chat("a.md")
+        st.session_state["_chat_messages__chat__2__doc__a.md"] = [{"role": "user"}]
+        self.assertTrue(docs.doc_chat_has_messages("a.md"))
+
+    def test_other_docs_messages_do_not_count(self):
+        docs.add_document("a.md")
+        docs.add_document("b.md")
+        st.session_state["_chat_messages__doc__b.md"] = [{"role": "user"}]
+        self.assertFalse(docs.doc_chat_has_messages("a.md"))
+
+    def test_close_with_empty_chat_removes_immediately(self):
+        docs.add_document("a.md")
+        docs.add_document("b.md")
+        with (
+            patch("md_llm.docs.st.rerun") as rerun,
+            patch("md_llm.docs._confirm_close_document") as confirm,
+        ):
+            docs.close_document("a.md")
+        confirm.assert_not_called()
+        self.assertEqual(docs.open_documents(), ["b.md"])
+        rerun.assert_called_once()
+
+    def test_close_with_non_empty_chat_confirms_first(self):
+        docs.add_document("a.md")
+        docs.add_document("b.md")
+        st.session_state["_chat_messages__doc__a.md"] = [{"role": "user"}]
+        with (
+            patch("md_llm.docs.st.rerun") as rerun,
+            patch("md_llm.docs._confirm_close_document") as confirm,
+        ):
+            docs.close_document("a.md")
+        confirm.assert_called_once_with("a.md")
+        rerun.assert_not_called()
+        self.assertEqual(docs.open_documents(), ["a.md", "b.md"])
 
 
 class ChatScopingTests(unittest.TestCase):

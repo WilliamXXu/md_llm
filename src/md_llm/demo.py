@@ -30,8 +30,8 @@ a top-of-page ``st.tabs`` works too) to select the active view, then calls
 
 from __future__ import annotations
 
+import html
 import json
-import os
 from pathlib import Path
 
 import streamlit as st
@@ -117,9 +117,33 @@ def _preserve_reader_scroll():
       4. **Real user input stops the restore.** Wheel / touch / scroll keys
          close the restore window; scroll *events* alone never do (Streamlit
          fires plenty of those during remount that the user never caused).
+      5. **Only touch storage when the DOM shows *our* document.** A hidden
+         ``<div data-mdllm-doc="...">`` (rendered just above this iframe)
+         names the document the main area currently holds, and every
+         save/restore is gated on it matching the document this iframe was
+         mounted for. Without it, switching documents poisons the bookmark:
+         the outgoing iframe's teardown save fires *after* the new document's
+         content has already replaced the old in the DOM (but before the
+         incoming iframe claims the token), so it writes the NEW document's
+         topmost heading under the OLD document's key — and every later
+         restore misses, polls for ~6 s, and gives up. With the gate the
+         outgoing iframe simply goes quiet, keeping each key's last good
+         value; and since only the content is swapped in place (the scroller
+         survives the switch), a document with nothing saved is explicitly
+         reset to the top instead of inheriting the previous document's
+         scrollTop.
     """
     doc_name = st.session_state.get("_reader_target", "")
     key = json.dumps("mdllm_reader_heading::" + doc_name)
+    # Hidden marker naming the document the main area is showing. Rendered
+    # BEFORE the iframe so it is already in the DOM — and already updated on
+    # a document switch, in the same React commit as the reader content —
+    # by the time any script inside the iframe runs (see guard 5 above).
+    st.markdown(
+        f'<div data-mdllm-doc="{html.escape(doc_name, quote=True)}" '
+        'style="display:none"></div>',
+        unsafe_allow_html=True,
+    )
     components.html(
         f"""
         <script>
@@ -127,6 +151,16 @@ def _preserve_reader_scroll():
           try {{
             var d = window.parent.document;
             var K = {key};
+            var DOC = {json.dumps(doc_name)};
+
+            // Which document is the main area showing RIGHT NOW? Read from
+            // the marker div at call time (never cached): on a document
+            // switch the marker flips together with the reader content, so
+            // this is the ground truth for "is the DOM still mine?".
+            function domDoc() {{
+              var m = d.querySelector('[data-mdllm-doc]');
+              return m ? (m.getAttribute('data-mdllm-doc') || '') : '';
+            }}
 
             // --- Singleton token: only the most recent mount acts -----
             // During a Streamlit rerun the new iframe is created before
@@ -215,6 +249,10 @@ def _preserve_reader_scroll():
               // Don't save mid-restore: the pre-restore position would
               // clobber the saved heading before the reader has scrolled.
               if (restoreOpen) return;
+              // Don't save over a document switch: the outgoing iframe
+              // outlives the content swap, and an unguarded save here would
+              // write the NEW document's heading under THIS document's key.
+              if (domDoc() !== DOC) return;
               var h = topHeading();
               if (h) {{
                 try {{ sessionStorage.setItem(K, sigOf(h)); }} catch (e) {{}}
@@ -239,6 +277,21 @@ def _preserve_reader_scroll():
                               && jumpAge >= 0 && jumpAge < 30000;
               if (jumpFresh) restoreOpen = false;
             }} catch (e) {{}}
+
+            // Nothing saved = first read of this document: start it at the
+            // top. On a document switch only the content is swapped in
+            // place — the scroller survives with the previous document's
+            // scrollTop — so without this a never-scrolled document would
+            // open mid-way down. Stands down for a fresh TOC jump.
+            if (!restoreOpen) {{
+              requestAnimationFrame(function () {{
+                if (!alive() || restoreOpen || userInput) return;
+                if (jumpFresh) return;
+                var sc = findScroller();
+                if (!sc || domDoc() !== DOC) return;
+                sc.scrollTop = 0;
+              }});
+            }}
 
             // Real user input (wheel / touch / scroll keys) — the ONLY
             // thing that should stop a restore and re-enable saves.
@@ -280,6 +333,10 @@ def _preserve_reader_scroll():
             // --- Restore: scroll the saved heading near the top --------
             function tryRestore() {{
               if (!alive() || !restoreOpen || userInput) return;
+              // Wait until the DOM is really showing OUR document: right
+              // after a switch the content may still be mid-swap, and
+              // restoring against another document's headings is garbage.
+              if (domDoc() !== DOC) return;
               var scroller = findScroller();
               if (!scroller) return;
               var sep = saved.indexOf('|');
@@ -352,6 +409,57 @@ def _preserve_reader_scroll():
     )
 
 
+def _upload_file_id(u):
+    """Stable identity of one uploader entry across reruns.
+
+    Streamlit assigns each browser upload a unique ``file_id``; while the
+    widget value is merely replayed from session state (any rerun the user
+    didn't pick a file for) the id stays the same, and re-picking a file —
+    even an unchanged one — produces a new one. That's exactly the signal
+    :func:`_stage_new_uploads` needs. Older Streamlits without ``file_id``
+    fall back to ``(name, size)``, which at least skips duplicates picked
+    into the same uploader session.
+    """
+    fid = getattr(u, "file_id", None)
+    return fid if fid is not None else (u.name, u.size)
+
+
+def _stage_new_uploads(uploaded):
+    """Write + open ONLY uploads whose file_id wasn't seen in a prior run.
+
+    st.file_uploader returns the same value on every rerun, so a name-based
+    "already staged" check would either re-open every file on every rerun or
+    (with the closed-document prune that preceded this) re-open a document on
+    the very rerun its ✕ close triggered. The per-upload file_id set in
+    ``_LAST_UPLOAD_KEY`` tells a genuine (re-)pick — new file_id — from a
+    plain replay, so:
+
+      * a fresh pick stages the file and opens it (``keep_open=True``);
+      * a rerun that merely replays the widget value stages nothing;
+      * re-picking a file whose document was closed re-opens it (new
+        file_id), which a replay of the close's own rerun never does.
+    """
+    if not uploaded:
+        st.session_state.pop(_LAST_UPLOAD_KEY, None)
+        return
+    seen = st.session_state.get(_LAST_UPLOAD_KEY) or {}
+    fresh = dict(seen)
+    for u in uploaded:
+        fid = _upload_file_id(u)
+        if fid in seen:
+            continue
+        dest = _UPLOADS_DIR / u.name
+        try:
+            with open(dest, "wb") as f:
+                f.write(u.getvalue())
+        except OSError as e:
+            st.error(f"Could not stage file: {e}")
+            st.stop()
+        md_llm.open_in_reader(u.name, keep_open=True)
+        fresh[fid] = u.name
+    st.session_state[_LAST_UPLOAD_KEY] = fresh
+
+
 def main():
     st.set_page_config(page_title="md_llm demo", layout="wide", page_icon="📖")
     _ensure_work_dirs()
@@ -403,6 +511,18 @@ def main():
                 # the container would hide the only remaining way to add files.
                 ".st-key-_demo_upload [data-testid=\"stFileChip\"]{"
                 "display:none!important}"
+                # Hiding the chip alone is not enough: Streamlit (1.58) wraps
+                # each chip in a testid-less row div, and those zero-height
+                # rows still generate the chips list's flex gap — ~8px of
+                # dead space per uploaded file (15 files measured 112px),
+                # pushing the "+" button and everything below it down until
+                # the ~250px (~5-chip) internal scroll cap kicks in. Hide the
+                # whole scrollable chips wrapper (the only DIV child of
+                # stFileChips — the "+" button is its BUTTON sibling) so the
+                # uploader's height stays constant no matter how many files
+                # were picked.
+                ".st-key-_demo_upload [data-testid=\"stFileChips\"]>div{"
+                "display:none!important}"
                 # Turn the lone button in here into a compact square "+". This
                 # covers both states: the pre-upload "Upload" button and the
                 # post-upload "Add files" button (which already carries a
@@ -426,34 +546,21 @@ def main():
                 type=["md", "txt"],
                 accept_multiple_files=True,
                 label_visibility="collapsed",
-                help="Opens your OS file dialog (shift-click to pick several). "
-                     "Each file is read into a local working directory, and each "
-                     "gets its own Reader + LLM chat — switch between them with "
-                     "the buttons below.",
             )
-        # Stage + open ONLY newly-added uploads: st.file_uploader keeps
-        # returning the same list on every rerun, so re-running this block each
-        # time would re-call open_in_reader() and force the view back to Reader
-        # every rerun (making the chat unreachable while files are open, since
-        # the active view is st.session_state[TABS_KEY]). Files staged in a
-        # previous run (stored as a set of names) are skipped.
-        staged = st.session_state.get(_LAST_UPLOAD_KEY, set())
-        if uploaded:
-            for u in uploaded:
-                if u.name in staged:
-                    continue
-                dest = _UPLOADS_DIR / u.name
-                try:
-                    with open(dest, "wb") as f:
-                        f.write(u.getvalue())
-                except OSError as e:
-                    st.error(f"Could not stage file: {e}")
-                    st.stop()
-                md_llm.open_in_reader(u.name, keep_open=True)
-                staged.add(u.name)
-            st.session_state[_LAST_UPLOAD_KEY] = staged
-        else:
-            st.session_state.pop(_LAST_UPLOAD_KEY, None)
+        # Stage + open ONLY newly-picked uploads: st.file_uploader keeps
+        # returning the same value on every rerun, so re-running this block
+        # each time would re-call open_in_reader() and force the view back to
+        # Reader every rerun (making the chat unreachable while files are
+        # open, since the active view is st.session_state[TABS_KEY]). A name
+        # set can't tell a fresh pick from a mere replay: closing a document
+        # (its ✕, the Reader's Clear) triggers a rerun that would see the
+        # name unstaged and instantly re-open the file the user just closed.
+        # So _stage_new_uploads tracks each upload's Streamlit file_id
+        # (unique per browser upload, stable while the widget value is merely
+        # replayed from session state): a file is staged only when its
+        # file_id is new — re-picking a closed file re-opens it, while the
+        # rerun right after its ✕ leaves it closed.
+        _stage_new_uploads(uploaded)
 
         # View switcher: the open-document buttons below replace the old
         # "Reader" nav button — clicking a document switches to it AND jumps

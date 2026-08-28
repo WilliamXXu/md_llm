@@ -297,7 +297,7 @@ def _render_autossh_panel(prefix="chat_", in_sidebar=False, default=None,
             _stop_autossh(prefix, cfg)
             st.info("Requested tunnel stop.")
             st.rerun()
-        if col_verify.button("Verify", help="curl http://127.0.0.1:<port>/",
+        if col_verify.button("Verify",
                              width="stretch",
                              key=f"_{prefix}autossh_verify"):
             running, detail = _autossh_status(cfg, prefix)
