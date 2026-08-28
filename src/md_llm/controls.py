@@ -343,12 +343,14 @@ def _current_opencode_variant(prefix=""):
     return None
 
 
-# The OpenCode "clear sandbox" button's session-state key. It deliberately does
-# NOT follow the {prefix}llm_* naming convention: the chat panel snapshots every
-# chat_* key and re-seeds it before the controls mount, and Streamlit forbids
-# injecting session_state for BUTTON keys (StreamlitValueAssignmentNotAllowed-
-# Error). A leading "_" keeps it outside all snapshot prefixes.
-OPENCODE_CLEAR_SANDBOX_KEY = "_opencode_clear_sandbox"
+# The OpenCode "clear sandbox" button key. It is suffixed per panel
+# (``f"_opencode_clear_sandbox{p.rstrip('_')}"``) so the manual (prefix="") and
+# chat (prefix="chat_") panels don't emit the same auto/button ID. The leading
+# "_" (and the fact it never starts with "chat_") keeps it outside the chat_*
+# snapshot, which would otherwise re-inject a BUTTON key and raise
+# StreamlitValueAssignmentNotAllowedError. This constant is the chat-panel
+# variant, used by tests to assert the snapshot-exclusion contract.
+OPENCODE_CLEAR_SANDBOX_KEY = "_opencode_clear_sandboxchat"
 
 
 def _render_opencode_controls(prefix, saved_llm):
@@ -390,7 +392,7 @@ def _render_opencode_controls(prefix, saved_llm):
         options,
         key=f"{p}llm_opencode_model_sel",
     )
-    if scol2.button("Refresh"):
+    if scol2.button("Refresh", key=f"_opencode_refresh{p.rstrip('_')}"):
         st.session_state.pop("_opencode_models_cache", None)
         st.rerun()
     if st.session_state.get(f"{p}llm_opencode_model_sel") == "(other — type below)":
@@ -438,7 +440,7 @@ def _render_opencode_controls(prefix, saved_llm):
             "data folder) now also means managed mode."
         ),
     )
-    if st.button("Clear this chat's sandbox", key=OPENCODE_CLEAR_SANDBOX_KEY):
+    if st.button("Clear this chat's sandbox", key=f"_opencode_clear_sandbox{p.rstrip('_')}"):
         doc = docs.active_document()
         sb_key = docs.chat_key("_opencode_sandbox", docs.active_chat(doc), doc)
         path = st.session_state.pop(sb_key, None)
