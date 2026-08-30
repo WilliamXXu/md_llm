@@ -424,6 +424,33 @@ def _upload_file_id(u):
     return fid if fid is not None else (u.name, u.size)
 
 
+def _open_query_docs():
+    """Open any documents named in the page URL's ``?open=`` query parameter.
+
+    Server-side half of the macOS app-bundle handshake: Finder hands a
+    double-clicked ``.md`` file to the ``md_llm.app`` launcher script, which
+    stages a copy of it into ``_UPLOADS_DIR`` and opens the browser at
+    ``/?open=<basename>``. A plain shell-script bundle cannot deliver an
+    Apple Event into a running Streamlit session, so the URL parameter is
+    the channel. Each browser tab is its own Streamlit session, so the
+    parameter only affects the tab that carries it.
+
+    The parameter is consumed exactly once (deleting it reruns the script
+    with the parameter gone) so an in-tab reload doesn't re-open it and the
+    visible URL doesn't carry a stale file name.
+    """
+    names = [n for n in st.query_params.get_all("open") if n]
+    if not names:
+        return
+    for name in names:
+        # Basename only — the launcher stages flat into _UPLOADS_DIR — and
+        # only open what is really staged (the Reader's path guard would
+        # refuse anything else anyway).
+        if (_UPLOADS_DIR / Path(name).name).is_file():
+            md_llm.open_in_reader(Path(name).name, keep_open=True)
+    del st.query_params["open"]
+
+
 def _stage_new_uploads(uploaded):
     """Write + open ONLY uploads whose file_id wasn't seen in a prior run.
 
@@ -464,6 +491,7 @@ def main():
     st.set_page_config(page_title="md_llm demo", layout="wide", page_icon="📖")
     _ensure_work_dirs()
     _install_core()
+    _open_query_docs()
 
     with st.sidebar:
         # A single "+" button at the top of the sidebar to open the OS file

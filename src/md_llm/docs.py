@@ -8,8 +8,8 @@ with ``open_in_reader(relpath, keep_open=True)`` (or calling
 :func:`add_document` directly). From then on:
 
   * every open document keeps its own conversation (``_chat_messages``),
-    background stream task (``_chat_bg_task``), last chat error, and staged
-    Reader quote — namespaced via :func:`doc_key` as
+    background stream task (``_chat_bg_task``), last chat error, and the
+    staged ⚡ Summarize prompt — namespaced via :func:`doc_key` as
     ``<base>__doc__<relpath>`` so nothing leaks across documents;
   * a file can be open at most once — :func:`add_document` refuses a second
     copy of an already-open file (a different relpath resolving to it, e.g.
@@ -25,7 +25,8 @@ with ``open_in_reader(relpath, keep_open=True)`` (or calling
 On top of the document registry sits a per-document **chat-session registry**
 (:func:`chat_sessions` / :func:`add_chat` / :func:`remove_chat`): any document
 can have several independent chat sessions ("tabs"), each with its own
-conversation, background stream task, last error, and staged Reader quote.
+conversation, background stream task, last error, and staged
+⚡ Summarize prompt.
 Sessions are keyed via :func:`chat_key` as ``<base>__chat__<id>__doc__<relpath>``
 (the first session deliberately keeps the document's legacy keys, so existing
 single-chat sessions are untouched). The session registry is session-memory
@@ -38,7 +39,8 @@ one at a time keep today's exact behaviour.
 
 Decoupling: this module knows nothing about reader/chat internals. It shares
 the reader's ``_reader_target`` key by literal string (the same string-literal
-convention ``_reader_quote`` already uses between reader.py and chat.py), and
+convention ``_reader_quick_prompt`` already uses between reader.py and
+chat.py), and
 it cleans up per-document keys by their ``__doc__<relpath>`` suffix rather than
 naming them individually.
 """
@@ -94,7 +96,7 @@ def doc_key(base_key, doc_id):
     ``doc_id`` None/"" (single-document mode) maps to the bare ``base_key``,
     so pre-multi-doc sessions keep their exact legacy keys; otherwise
     ``<base_key>__doc__<doc_id>`` isolates one document's conversation, staged
-    quote, and stream task from every other open document's.
+    quick prompt, and stream task from every other open document's.
     """
     if not doc_id:
         return base_key
@@ -109,7 +111,8 @@ def chat_key(base_key, chat_id, doc_id):
     and to the bare ``base_key`` in single-document mode. Additional sessions
     add a ``__chat__<id>`` segment between the base and the (optional)
     ``__doc__<relpath>`` suffix, so every session's conversation, stream task,
-    staged quote, and last error are isolated from every other session's.
+    staged quick prompt, and last error are isolated from every other
+    session's.
     """
     if not chat_id or chat_id == 1:
         return doc_key(base_key, doc_id)
@@ -240,7 +243,8 @@ def set_active_document(rel):
     """Make ``rel`` the active document (the Reader and chat tab follow it).
 
     Also mirrors it into the reader's ``_reader_target`` key (by literal
-    string — the same decoupling convention ``_reader_quote`` uses) so the
+    string — the same decoupling convention ``_reader_quick_prompt`` uses) so
+    the
     Reader always shows the active document. Clears the "(no document)" flag
     so :func:`active_document` reports the real document.
     """
@@ -272,7 +276,10 @@ def remove_document(rel):
         st.session_state.pop(_DOC_SELECT_LAST, None)
         st.session_state.pop(_NO_DOC_ACTIVE, None)
         st.session_state.pop("_reader_target", None)
-        st.session_state.pop("_reader_quote", None)
+        # The Reader's staged ⚡ Summarize prompt (legacy bare key in
+        # single-document mode; per-doc keys are swept by _drop_doc_keys
+        # above). Without this it would fire into the NEXT document's chat.
+        st.session_state.pop("_reader_quick_prompt", None)
         return
     # Don't disturb the "(no document)" context if it was active — the user
     # may be closing documents while chatting without context.
@@ -300,7 +307,7 @@ def reset_documents():
 #
 # A document's chat tab can hold any number of sessions ("tabs"): each session
 # has its own conversation history, background stream task, last error, and
-# staged Reader quote, keyed via chat_key(). Session ids are ints; id 1 keeps
+# staged quick prompt, keyed via chat_key(). Session ids are ints; id 1 keeps
 # the document's legacy keys so existing single-chat sessions survive. The
 # registry is session-memory only and is dropped together with the document
 # (its keys end with ``__doc__<relpath>``, so remove_document sweeps them).
@@ -368,16 +375,18 @@ def set_active_chat(chat_id, doc_id):
     st.session_state[_chat_active_key(doc_id)] = chat_id
 
 
-def add_chat(doc_id):
+def add_chat(doc_id, label=None):
     """Open a new chat session for ``doc_id`` and make it active.
 
     Returns the new session id. Sessions are numbered 1, 2, 3, …; the first
     keeps the document's legacy keys (see :func:`chat_key`), later ones live
-    under ``__chat__<id>`` keys so they never collide.
+    under ``__chat__<id>`` keys so they never collide. ``label`` overrides the
+    default "Chat <n>" display name (the Reader's ⚡ Summarize quick action
+    opens each of its sessions as "Summary").
     """
     reg = _session_registry(doc_id, create=True)
     new_id = max(reg) + 1
-    reg[new_id] = f"Chat {new_id}"
+    reg[new_id] = label or f"Chat {new_id}"
     st.session_state[_chat_sessions_key(doc_id)] = reg
     set_active_chat(new_id, doc_id)
     return new_id
@@ -387,8 +396,8 @@ def remove_chat(chat_id, doc_id):
     """Close a chat session for ``doc_id`` and drop its state.
 
     The last remaining session can't be closed (a document always has one);
-    otherwise the session's conversation, stream task, staged quote, and last
-    error are dropped, and — if it was active — the first remaining session
+    otherwise the session's conversation, stream task, staged quick prompt,
+    and last error are dropped, and — if it was active — the first remaining session
     becomes active.
     """
     reg = _session_registry(doc_id)
@@ -403,15 +412,14 @@ def remove_chat(chat_id, doc_id):
 
 # The chat-session state bases that get session-scoped (the conversation, its
 # background stream task, the transient last error, and the Reader's staged
-# quote + quote textarea). Session 1's keys are exactly these document-scoped
+# ⚡ Summarize prompt). Session 1's keys are exactly these document-scoped
 # / bare keys, so closing session 1 drops them by name in single-document mode
 # (where no ``__doc__`` suffix exists to match on).
 _CHAT_SCOPED_BASES = (
     "_chat_messages",
     "_chat_bg_task",
     "_chat_last_error",
-    "_reader_quote",
-    "_reader_quote_area",
+    "_reader_quick_prompt",
 )
 
 
@@ -451,7 +459,7 @@ def _drop_doc_keys(rel):
 
     A closed document must not resurrect its old conversation when re-opened.
     Matching by the ``__doc__<rel>`` suffix covers all per-document keys (chat
-    messages, stream task, staged quote, quote box) without this module naming
+    messages, stream task, staged quick prompt) without this module naming
     each one individually.
     """
     suffix = f"{_DOC_KEY_SEP}{rel}"
@@ -492,7 +500,7 @@ def doc_chat_has_messages(rel):
 
     Used by :func:`close_document` to warn before a close wipes a
     conversation. The message base key is shared with chat.py by literal
-    string (the same convention ``_reader_quote`` uses).
+    string (the same convention ``_reader_quick_prompt`` uses).
     """
     for sid in chat_sessions(rel):
         if st.session_state.get(chat_key("_chat_messages", sid, rel)):

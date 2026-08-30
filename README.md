@@ -6,15 +6,20 @@ panel for any markdown/text files. Plugs into any Streamlit host app.
 Four LLM providers (stdlib-only clients, no SDK):
 
 - **Ollama** — local server (optional `autossh` tunnel to a remote box).
-- **OpenRouter** — hosted API keyed by `OPENROUTER_API_KEY`.
+- **OpenRouter** — hosted API keyed by `OPENROUTER_API_KEY`. The Model
+  dropdown auto-populates with the catalog's current free models (public
+  `GET /models`, fetched once per session; **Refresh** re-fetches). The
+  last-used model and endpoint URL are memorized in settings; the API key is
+  write-only (session memory, never persisted).
 - **OpenAI-compatible** — any `/chat/completions` host (OpenAI, Groq, Together,
   …); models **and** the API key are remembered per endpoint URL.
 - **OpenCode** — the open source coding **agent**, invoked via
   `opencode run --format json --auto` (subprocess, full agent with tools).
   Auth/model routing are OpenCode's own; the panel exposes a working directory,
-  an optional `--attach` server URL, an optional agent, and an optional
-  provider-specific model variant (`--variant`). Models come from
-  `opencode models`.
+  an optional `--attach` server URL, an optional agent, and a model variant
+  (`--variant`, the provider's reasoning effort). Models — and each model's
+  available variants — are discovered automatically via
+  `opencode models --verbose`; the highest-effort variant is preselected.
 
 ## Install
 
@@ -74,8 +79,8 @@ with st.sidebar:
 
 By default one document is open at a time. To open several files — each with
 its own Reader view and an **independent** LLM chat (separate conversation
-history, streaming task, staged quotes) — pass `keep_open=True` when staging,
-and mount the document picker in your sidebar:
+history, streaming task, staged summary prompts) — pass `keep_open=True` when
+staging, and mount the document picker in your sidebar:
 
 ```python
 md_llm.open_in_reader("notes.md", keep_open=True)    # open + activate
@@ -106,8 +111,8 @@ with st.sidebar:
 By default each document has a single chat. From the chat panel, **+ New**
 opens another independent chat session ("tab") for the same document, and the
 session selector switches between them — each session keeps its own
-conversation history, background stream task, staged Reader quotes, and last
-error, so chats about the same file never mix:
+conversation history, background stream task, staged ⚡ Summarize prompt, and
+last error, so chats about the same file never mix:
 
 - Sessions are numbered `Chat 1`, `Chat 2`, …; the first one keeps the
   document's legacy keys, later ones live under `__chat__<id>`-namespaced
@@ -116,8 +121,13 @@ error, so chats about the same file never mix:
 - The provider/model/key controls are shared panel-wide; sessions differ only
   in their conversations and streams, which keep running in the background
   while you switch sessions or documents.
-- A passage quoted in the Reader ("Send to chat") attaches to the chat session
-  that was active when it was staged — the Reader names the target session.
+- The Reader's **⚡ Summarize** quick action (left of **Copy**) opens a **new
+  "Summary" chat tab** for the open document each time it is clicked and sends
+  the document there — using the chat panel's existing provider/model settings
+  and an editable summary prompt (the **Quick summarize prompt** expander at
+  the top of the Reader; edits stick for the browser session). If a reply is
+  still streaming in the new tab, the staged prompt queues and sends
+  automatically when the reply finishes.
 - Closing a document drops all of its sessions.
 
 ### Optional: forward md_llm events into a host console
@@ -147,7 +157,9 @@ settings file) is injected via `Core` at `init()`. Settings are a plain JSON
 dict on disk; the OpenAI-compatible endpoint/model/key registry lives under the
 `llm.oai_endpoints` key. Saved chats are plain `<docstem>__chat_<UTC>.md` files
 (no sidecar metadata, no transcript linkage) — md_llm has no notion of
-"transcripts".
+"transcripts". The chat panel's **Save location** expander overrides where they
+go: the chosen directory is memorized under `llm.chat_save_dir` (validated
+before saving, with the host's `chat_save_dir` as the fallback default).
 
 ## Layout
 
@@ -161,7 +173,7 @@ src/md_llm/
 ├── controls.py   # provider/model/endpoint widgets + per-endpoint OAI registry
 ├── autossh.py    # optional remote Ollama SSH tunnel panel
 ├── docs.py       # optional multi-document registry + per-doc chat-session registry + sidebar picker
-├── reader.py     # render_reader + render_toc — markdown/text viewer, clickable TOC, quote-to-chat
+├── reader.py     # render_reader + render_toc — markdown/text viewer, clickable TOC, ⚡ Summarize quick action
 ├── chat.py       # render_chat — streaming multi-turn chat (independent per open doc AND per session)
 └── demo.py       # standalone Streamlit entry point
 ```

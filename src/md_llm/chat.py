@@ -17,7 +17,7 @@ On top of that, any document can hold **several chat sessions** ("tabs"):
 the session buttons at the top of this panel pick the active one, ``+ New``
 opens another independent conversation about the same document, and ``✕``
 closes the current one. Each session keeps its own conversation, background
-stream task, last error, and staged Reader quote, keyed via
+stream task, last error, and staged Reader ⚡ Summarize prompt, keyed via
 ``docs.chat_key`` as ``<base>__chat__<id>__doc__<relpath>`` (session 1 keeps
 the document's legacy keys). Provider/model/key controls are shared panel-wide
 — sessions differ only in their conversations and streams.
@@ -26,10 +26,13 @@ The assistant reply is streamed token-by-token via ``st.write_stream`` (both
 OpenRouter's SSE deltas and Ollama's newline-delimited chunks are supported).
 
 The conversation lives in session memory (``_chat_messages``); a **Save
-conversation** button writes it to ``core.chat_save_dir`` as a plain
-``<docstem>__chat_<UTC>.md`` file. No sidecar metadata, no transcript linkage —
-md_llm has no notion of "transcripts". The provider/model/key controls live in
-this panel under the ``chat_`` key namespace.
+conversation** button writes it as a plain ``<docstem>__chat_<UTC>.md`` file
+into the **Save location** directory — a memorized choice (settings key
+``llm.chat_save_dir``, editable in the expander under the save buttons) that
+falls back to the host's ``core.chat_save_dir``. No sidecar metadata, no
+transcript linkage — md_llm has no notion of "transcripts". The
+provider/model/key controls live in this panel under the ``chat_`` key
+namespace.
 """
 
 from __future__ import annotations
@@ -54,6 +57,8 @@ from .controls import (
     _oai_registry_entry,
     _remember_oai_endpoint,
     _remember_opencode_model,
+    _remember_openrouter_endpoint,
+    _remember_openrouter_model,
     _render_llm_controls,
     _save_oai_registry_entry,
 )
@@ -73,10 +78,12 @@ _CHAT_MESSAGES = "_chat_messages"  # list[{"role","content"}]
 # subprocess, whose generator kills the process on close. Keys: text/done/error/source.
 _CHAT_BG_TASK = "_chat_bg_task"
 
-# A passage staged in the Reader ("Send to chat") to attach to the NEXT chat
-# question. Read here by literal string (matches reader.py) rather than imported
-# from .reader, to keep chat↔reader decoupled. Cleared once attached.
-_READER_QUOTE = "_reader_quote"
+# A prompt staged by the Reader's ⚡ Summarize quick action for the NEXT chat
+# turn of the ACTIVE document + chat session (the button also opens a new
+# "Summary" session tab and switches the view here). Read here by literal
+# string (matches reader.py) rather than imported from .reader, to keep
+# chat↔reader decoupled. Popped and sent by _send_staged_quick_prompt.
+_READER_QUICK_PROMPT = "_reader_quick_prompt"
 
 
 def _chat_state_key(base):
@@ -91,10 +98,10 @@ def _chat_state_key(base):
     return docs.chat_key(base, docs.active_chat(doc), doc)
 
 
-def _staged_quote_key():
-    """Session key of the Reader quote staged for the ACTIVE session's chat."""
+def _staged_quick_prompt_key():
+    """Session key of the Reader ⚡ Summarize prompt staged for the ACTIVE session."""
     doc = docs.active_document()
-    return docs.chat_key(_READER_QUOTE, docs.active_chat(doc), doc)
+    return docs.chat_key(_READER_QUICK_PROMPT, docs.active_chat(doc), doc)
 
 
 def _session_sandbox_dir():
@@ -153,6 +160,83 @@ def _current_context_path():
 # ---------------------------------------------------------------------------
 # Saving the conversation
 # ---------------------------------------------------------------------------
+
+# Settings key (inside the ``llm`` subkey md_llm owns) holding the memorized
+# save directory. Absent/empty means "use the host's core.chat_save_dir".
+_SAVE_DIR_SETTING_KEY = "chat_save_dir"
+# Widget key of the Save-location text input. Starts with neither ``chat_`` nor
+# ``_chat_ssh_`` so the control snapshot ignores it: the value is persisted in
+# settings (not session memory) and the input re-mounts from there.
+_SAVE_DIR_INPUT_KEY = "_chat_save_dir_input"
+
+
+def _settings_chat_save_dir():
+    """The memorized save directory from settings ("" when none is stored)."""
+    llm_s = get_core().load_settings().get("llm")
+    if not isinstance(llm_s, dict):
+        return ""
+    val = llm_s.get(_SAVE_DIR_SETTING_KEY)
+    return val.strip() if isinstance(val, str) else ""
+
+
+def _remember_chat_save_dir(path):
+    """Persist `path` as the save directory under ``llm.chat_save_dir``.
+
+    An empty `path` clears the memorized choice, falling back to the host's
+    ``core.chat_save_dir``.
+    """
+    settings = get_core().load_settings()
+    llm_s = dict(settings.get("llm") or {})
+    path = (path or "").strip()
+    if path:
+        llm_s[_SAVE_DIR_SETTING_KEY] = path
+    else:
+        llm_s.pop(_SAVE_DIR_SETTING_KEY, None)
+    settings["llm"] = llm_s
+    get_core().save_settings(settings)
+
+
+def _chat_save_dir():
+    """Where the next save writes: the memorized directory or the host default."""
+    return _settings_chat_save_dir() or get_core().chat_save_dir
+
+
+def _save_dir_problem(path):
+    """Why `path` can't serve as the save directory, or None when it can.
+
+    Read-only checks — nothing is created here (the save itself makedirs). A
+    missing directory is fine as long as its nearest existing ancestor is a
+    writable directory; anything else (empty path, a file in the way, no write
+    permission) is reported so it can be fixed before saving.
+    """
+    raw = (path or "").strip()
+    if not raw:
+        return "Enter a directory path."
+    p = os.path.abspath(os.path.expanduser(raw))
+    if os.path.exists(p):
+        if not os.path.isdir(p):
+            return f"`{p}` is a file, not a directory."
+        if not os.access(p, os.W_OK | os.X_OK):
+            return f"No write permission in `{p}`."
+        return None
+    probe = os.path.dirname(p)
+    while probe and not os.path.exists(probe):
+        probe = os.path.dirname(probe)
+    if not probe:
+        return f"`{p}` has no existing parent directory to create it under."
+    if not os.path.isdir(probe):
+        return f"`{probe}` is a file, so `{p}` cannot be created under it."
+    if not os.access(probe, os.W_OK | os.X_OK):
+        return (
+            f"No write permission in `{probe}` — needed to create `{p}`."
+        )
+    return None
+
+
+def _on_save_dir_input_change():
+    """Memorize the Save-location input's committed value (widget callback)."""
+    _remember_chat_save_dir(st.session_state.get(_SAVE_DIR_INPUT_KEY))
+
 
 def _slugify_stem(path):
     """Filesystem-safe stem for a saved-chat filename, from a document path."""
@@ -233,17 +317,22 @@ def _chat_default_title(source_title, messages):
     return source_title or "Chat"
 
 
-def _write_chat_md(context_path, text):
-    """Write `text` as a ``<docstem>__chat_<UTC>.md`` in chat_save_dir.
+def _write_chat_md(context_path, text, save_dir=None):
+    """Write `text` as a ``<docstem>__chat_<UTC>.md`` in `save_dir`.
 
     Pure I/O (no Streamlit calls) so it is unit-testable. Each saved chat is
     a plain markdown file named after the source document stem plus a UTC
     timestamp (so multiple chats about the same doc don't collide). No sidecar
     metadata is written — md_llm has no transcript-linkage concept.
+    `save_dir` defaults to the memorized chat save directory (falling back to
+    the host's ``core.chat_save_dir``).
     Returns the absolute path, or None on write failure.
     """
-    save_dir = get_core().chat_save_dir
-    os.makedirs(save_dir, exist_ok=True)
+    save_dir = save_dir or _chat_save_dir()
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+    except OSError:
+        return None
     stem = _slugify_stem(context_path)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     # The timestamp is second-granular, so two rapid saves of the same document
@@ -265,8 +354,13 @@ def _write_chat_md(context_path, text):
     return out_path
 
 
-def _save_conversation(context_path, provider, model):
-    """Write the conversation to chat_save_dir.
+def _save_conversation(context_path, provider, model, save_dir=None):
+    """Write the conversation to the chat save directory.
+
+    `save_dir` overrides the memorized directory (kept for explicit/test
+    callers; the panel saves to :func:`_chat_save_dir`). Every outcome —
+    empty conversation, invalid directory, write failure, success — surfaces
+    a clear Streamlit message.
 
     Returns the saved absolute path, or None on failure / when the conversation
     is empty.
@@ -276,14 +370,25 @@ def _save_conversation(context_path, provider, model):
         st.warning("Nothing to save — the conversation is empty.")
         return None
 
+    target = save_dir or _chat_save_dir()
+    problem = _save_dir_problem(target)
+    if problem:
+        st.error(f"**Save failed** — {problem}")
+        return None
+
     text = _render_chat_as_markdown(context_path, provider, model)
     source_title = (
         _display_name_for_filepath(context_path) if context_path else ""
     )
     _chat_default_title(source_title, messages)  # computed for parity/title hooks
-    out_path = _write_chat_md(context_path, text)
+    out_path = _write_chat_md(context_path, text, save_dir=save_dir)
     if out_path is None:
-        st.error("Could not save conversation (write failed).")
+        st.error(
+            "**Save failed** — could not write to "
+            f"`{os.path.abspath(os.path.expanduser(target))}`. Check that the "
+            "directory exists and is writable (see Save location above)."
+        )
+        return None
     return out_path
 
 
@@ -298,9 +403,6 @@ def _send_context_and_turns(context_path):
     in context for the whole conversation), followed by an assistant ack, then
     the actual Q&A turns. The leading turn is rebuilt from disk each send, so
     opening a different document in the Reader takes effect on the next send.
-
-    A quote staged in the Reader ("Send to chat") is prepended to the final user
-    turn.
     """
     messages = []
     if context_path:
@@ -316,30 +418,8 @@ def _send_context_and_turns(context_path):
                            "What would you like to know?",
             })
     turns = list(st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or [])
-    _attach_quote_to_last_turn(turns)
     messages.extend(turns)
     return messages
-
-
-def _attach_quote_to_last_turn(turns):
-    """Prepend any staged Reader quote to the last user turn, then clear it.
-
-    Operates on a shallow copy of the turn list (the caller owns the live
-    session-state list). The quote is scoped to the active document, so it can
-    only ever attach to the chat it was quoted for.
-    """
-    quote = st.session_state.get(_staged_quote_key())
-    if not quote:
-        return
-    if not turns or turns[-1].get("role") != "user":
-        return
-    last = dict(turns[-1])
-    last["content"] = (
-        f"I want to focus on this passage from the document:\n\n"
-        f"> {quote}\n\n{last['content']}"
-    )
-    turns[-1] = last
-    st.session_state.pop(_staged_quote_key(), None)
 
 
 def _turns_to_opencode_prompt(turns):
@@ -402,6 +482,11 @@ def _build_stream(context_path, holder):
         endpoint = st.session_state.get(
             f"{p}llm_or_endpoint", llm.OPENROUTER_DEFAULT_ENDPOINT
         )
+        # Persist the chosen model + endpoint so they reappear next session,
+        # mirroring the OpenCode branch's model memory. The API key stays
+        # write-only by design — never persisted to disk.
+        _remember_openrouter_model(model)
+        _remember_openrouter_endpoint(endpoint)
         gen = llm.openrouter_chat_stream(
             turns, api_key=api_key, model=model, endpoint=endpoint,
             instruction=instruction,
@@ -468,6 +553,54 @@ def _build_stream(context_path, holder):
     return _safe_stream(gen, holder), None
 
 
+def _send_staged_quick_prompt(context_path):
+    """Send the Reader-staged ⚡ Summarize prompt as the next chat turn.
+
+    The Reader's quick-action button opens a new "Summary" session tab for the
+    active document, stages its prompt into that session (scoped per document +
+    chat session) and switches the view here; this pops it and runs the exact
+    ``st.chat_input`` pipeline — user turn appended to the conversation,
+    ``_build_stream`` snapshotting it, the stream handed to a background worker
+    thread. Returns the started task dict, or None when nothing was staged or
+    validation failed (the error lands in ``_chat_last_error`` and surfaces as
+    the transient error bubble, exactly like a failed typed send).
+
+    Must be called AFTER the chat controls have mounted this run: like a typed
+    send, it reads the ``chat_*`` provider/model/key values, and the OpenCode
+    variant default is only seeded when those controls render.
+    """
+    prompt = st.session_state.get(_staged_quick_prompt_key())
+    if prompt is None:
+        return None
+    st.session_state.pop(_staged_quick_prompt_key(), None)
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return None
+
+    provider = st.session_state.get("chat_llm_provider", "OpenRouter")
+    model = _current_llm_model(prefix="chat_") or "(unknown)"
+    chat_src = f"Quick summarize ({provider} · {model})"
+    preview = prompt.replace("\n", " ")[:80]
+    log_event(f"Chat send → {preview}", level="info", source=chat_src)
+
+    msgs = st.session_state.setdefault(_chat_state_key(_CHAT_MESSAGES), [])
+    msgs.append({"role": "user", "content": prompt})
+    holder = {}
+    stream, verr = _build_stream(context_path, holder)
+    if stream is None:
+        msgs.pop()  # validation failed: roll back the dangling question
+        st.session_state[_chat_state_key("_chat_last_error")] = verr
+        log_event(f"Chat failed: {verr}", level="error", source=chat_src)
+        return None
+    task = {"text": "", "done": False, "error": None, "source": chat_src}
+    worker = threading.Thread(
+        target=_stream_worker, args=(task, stream, holder), daemon=True,
+    )
+    st.session_state[_chat_state_key(_CHAT_BG_TASK)] = task
+    worker.start()
+    return task
+
+
 def _stream_worker(task, stream, holder):
     """Consume ``stream`` in a background thread, accumulating text into ``task``.
 
@@ -526,7 +659,7 @@ def _stream_partial_reply(task):
             )
 
 
-def _finalize_chat_task(task):
+def _finalize_chat_task(task, doc=None, chat_id=None):
     """Fold a finished background stream's outcome into session state.
 
     Called at the very TOP of ``render_chat`` — before any element renders —
@@ -549,16 +682,30 @@ def _finalize_chat_task(task):
 
     ``task`` is the worker dict (``text``/``done``/``error``/``source``);
     the caller pops the ``_CHAT_BG_TASK`` session key afterwards.
+    When ``doc``/``chat_id`` are given the task is finalized into that
+    document/session's conversation (used by the multi-doc finalizer that
+    scans all open documents). When omitted the active document/session is
+    used (backwards compatible for single-call sites).
     """
+    # Resolve the target keys for this task's document/session.  When the
+    # caller supplies doc/chat_id (the multi-doc scan) use those; otherwise
+    # fall back to the active document/session (the original single-task
+    # path).
+    if doc is None and chat_id is None:
+        err_key = _chat_state_key("_chat_last_error")
+        msg_key = _chat_state_key(_CHAT_MESSAGES)
+    else:
+        # Normalise: active_document() uses None for bare mode, docs.chat_key
+        # treats falsy as bare.
+        err_key = docs.chat_key("_chat_last_error", chat_id, doc)
+        msg_key = docs.chat_key(_CHAT_MESSAGES, chat_id, doc)
     if task.get("error"):
-        st.session_state[_chat_state_key("_chat_last_error")] = task["error"]
+        st.session_state[err_key] = task["error"]
         log_event(f"Chat failed: {task['error']}", level="error",
                   source=task.get("source", ""))
         return
     reply_text = (task.get("text") or "").strip()
-    st.session_state.setdefault(
-        _chat_state_key(_CHAT_MESSAGES), []
-    ).append({
+    st.session_state.setdefault(msg_key, []).append({
         "role": "assistant",
         "content": reply_text
         or "_(empty response — nothing came back.)_",
@@ -569,6 +716,44 @@ def _finalize_chat_task(task):
     else:
         log_event("Chat reply empty — nothing came back.",
                   level="warn", source=task.get("source", ""))
+
+
+def _finalize_all_done_tasks():
+    """Finalize every completed background stream across all open documents.
+
+    The original single-task finalizer only checked the *active* document's
+    ``_CHAT_BG_TASK`` key.  If the user switched documents while a stream was
+    running, the completed reply stayed under the original document's key and
+    was only finalized when the user switched back — until then ``Save
+    conversation`` for that document saw only the user turn (or appeared
+    empty) and the assistant reply seemed lost.  Scanning all open documents
+    and their chat sessions ensures every finished reply is folded into its
+    correct conversation on the very next render, no matter which document is
+    currently active.
+    """
+    # Collect all doc ids that might hold a task: every open document plus
+    # the bare (no-document) context.  ``open_documents()`` is [] in single-
+    # doc mode, so the bare entry is still checked.
+    seen_docs = set(docs.open_documents())
+    seen_docs.add(docs.active_document())
+    seen_docs.add("")  # bare / single-doc fallback
+    seen_docs.add(None)
+    for doc in list(seen_docs):
+        # Normalize None -> "" for chat_sessions lookup; docs.chat_sessions
+        # handles None/"" as bare.
+        doc_id = doc or ""
+        # In single-doc mode with no registry, chat_sessions("") returns [1];
+        # for an open doc it returns its actual sessions.
+        try:
+            sids = docs.chat_sessions(doc_id)
+        except Exception:
+            sids = [1]
+        for sid in sids:
+            key = docs.chat_key(_CHAT_BG_TASK, sid, doc_id)
+            task = st.session_state.get(key)
+            if task and task.get("done"):
+                _finalize_chat_task(task, doc_id, sid)
+                st.session_state.pop(key, None)
 
 
 def _tame_chat_autoscroll():
@@ -877,28 +1062,42 @@ def render_chat():
     The chat always targets whatever document is open in the Reader — open one
     there, then ask about it here. There is no separate dropdown.
     """
-    # --- Finalize a finished background task BEFORE anything renders ----
+    # --- Finalize finished background tasks BEFORE anything renders ----
     # The reply must join _CHAT_MESSAGES ahead of the history loop below so
     # this same run draws the complete conversation — one frontend commit,
     # no intermediate bubble-removed state, no second rerun. See
     # _finalize_chat_task for why that single-commit property is what keeps
     # Streamlit's sticky scroll-to-bottom container from yanking the
     # viewport down the moment the LLM finishes.
+    #
+    # Finalize *all* done tasks across every open document/session, not just
+    # the active one: if the user switched documents while a stream was
+    # running, the original document's completed reply would otherwise stay
+    # dangling under its own key until the user switched back, making
+    # ``Save conversation`` for that document appear empty.  Scanning all
+    # docs ensures every finished reply lands in its correct conversation
+    # immediately.
+    _finalize_all_done_tasks()
     _task = st.session_state.get(_chat_state_key(_CHAT_BG_TASK))
     if _task and _task.get("done"):
+        # Defensive: if the active task somehow still shows done (e.g. a
+        # race where it completed after the scan), finalize it now.
         _finalize_chat_task(_task)
         st.session_state.pop(_chat_state_key(_CHAT_BG_TASK), None)
         _task = None
+    # If the active task is still running, keep it for the streaming bubble;
+    # if it was just finalized above, _task is now None so the history loop
+    # draws the complete conversation.
 
     st.subheader("LLM chat")
 
     # --- Chat sessions for this document -------------------------------
     # A document can hold several independent chat sessions ("tabs"): each has
-    # its own conversation, stream task, staged quote, and last error (see
-    # docs.chat_key). Session buttons pick the active one (the active session
-    # is highlighted); "+ New" opens another independent conversation about
-    # the same document; "Close" drops the current one (never the last
-    # remaining session).
+    # its own conversation, stream task, staged ⚡ Summarize prompt, and last
+    # error (see docs.chat_key). Session buttons pick the active one (the
+    # active session is highlighted); "+ New" opens another independent
+    # conversation about the same document; "Close" drops the current one
+    # (never the last remaining session).
     _doc = docs.active_document()
     sessions = docs.chat_sessions(_doc)
     cur = docs.active_chat(_doc)
@@ -982,18 +1181,6 @@ def render_chat():
         "conversation lives in memory for this session only."
     )
 
-    # Show a staged Reader quote so the user knows their next question carries
-    # it as focused context (alongside the full document).
-    staged_quote = st.session_state.get(_staged_quote_key())
-    if staged_quote:
-        st.info(
-            f"**Quote attached to your next question** (alongside the full "
-            f"document):\n\n> {staged_quote}"
-        )
-        if st.button("Drop quote"):
-            st.session_state.pop(_staged_quote_key(), None)
-            st.rerun()
-
     # --- Controls (the only place chat_* widgets are instantiated) ------
     # No "Instruction / prompt" field here: in a chat the prompt comes from the
     # chat box, and a fixed instruction would otherwise hijack the system
@@ -1011,18 +1198,69 @@ def render_chat():
     # key, so it survives the Reader-view runs that prune the widget keys.
     _snapshot_chat_controls()
 
+    # --- Quick action staged in the Reader (⚡ Summarize) ----------------
+    # The Reader's quick-action button stages its prompt and switches here;
+    # send it through the normal pipeline — but only when this session has no
+    # stream running. While one does, the staged prompt waits: the very rerun
+    # that finalizes the running reply clears _task at the top of this
+    # function, so that same run picks the queued prompt up and sends it.
+    if not _task:
+        _started = _send_staged_quick_prompt(context_path)
+        if _started:
+            _task = _started
+    elif st.session_state.get(_staged_quick_prompt_key()):
+        st.info(
+            "A **⚡ Summarize** prompt from the Reader is staged — it sends "
+            "automatically when the current reply finishes."
+        )
+        if st.button("Drop staged prompt", key="_chat_drop_quick_prompt"):
+            st.session_state.pop(_staged_quick_prompt_key(), None)
+            st.rerun()
+
     col_save, col_clear, _ = st.columns([1, 1, 2])
     if col_save.button("Save conversation"):
         provider = st.session_state.get("chat_llm_provider", "OpenRouter")
         model = _current_llm_model(prefix="chat_") or "(none)"
         saved = _save_conversation(context_path, provider, model)
         if saved:
-            st.success(f"Saved: `{os.path.basename(saved)}`")
-            st.rerun()
+            # No st.rerun() here: a rerun discards the current run's output,
+            # so the success message (like any st.error/warning from
+            # _save_conversation) would never reach the screen. The message
+            # simply stays up until the next interaction.
+            st.success(f"Conversation saved to `{saved}`")
     if col_clear.button("Clear conversation"):
         st.session_state.pop(_chat_state_key(_CHAT_MESSAGES), None)
         st.session_state.pop(_chat_state_key(_CHAT_BG_TASK), None)
         st.rerun()
+
+    # --- Save location (memorized; default = the host's chat_save_dir) ---
+    # Rendered every run, even collapsed: the on_change callback persists each
+    # committed edit to settings, and the inline validation keeps the shown
+    # target honest before the user clicks Save.
+    with st.expander("Save location", expanded=False):
+        st.caption(
+            "Saved chats are written here as `<docstem>__chat_<UTC>.md`. "
+            f"Host default: `{get_core().chat_save_dir}`."
+        )
+        st.text_input(
+            "Directory",
+            value=_chat_save_dir(),
+            key=_SAVE_DIR_INPUT_KEY,
+            on_change=_on_save_dir_input_change,
+            help=(
+                "Edit and press Enter to change where conversations are "
+                "saved — your choice is remembered across sessions. Clear "
+                "the field to fall back to the host default."
+            ),
+        )
+        problem = _save_dir_problem(_chat_save_dir())
+        if problem:
+            st.error(problem)
+        else:
+            st.caption(
+                f"Ready — the next save writes to "
+                f"`{os.path.abspath(os.path.expanduser(_chat_save_dir()))}`."
+            )
 
     st.divider()
 

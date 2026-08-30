@@ -119,13 +119,11 @@ class RegistryTests(unittest.TestCase):
             {"role": "user", "content": "hi"},
         ]
         st.session_state["_chat_bg_task__doc__a.md"] = {"done": True}
-        st.session_state["_reader_quote__doc__a.md"] = "a passage"
-        st.session_state["_reader_quote_area__doc__a.md"] = "a passage"
+        st.session_state["_reader_quick_prompt__doc__a.md"] = "summarize"
         docs.remove_document("a.md")
         self.assertNotIn("_chat_messages__doc__a.md", st.session_state)
         self.assertNotIn("_chat_bg_task__doc__a.md", st.session_state)
-        self.assertNotIn("_reader_quote__doc__a.md", st.session_state)
-        self.assertNotIn("_reader_quote_area__doc__a.md", st.session_state)
+        self.assertNotIn("_reader_quick_prompt__doc__a.md", st.session_state)
 
     def test_remove_document_keeps_other_docs_state(self):
         docs.add_document("a.md")
@@ -310,6 +308,17 @@ class ChatSessionRegistryTests(unittest.TestCase):
         self.assertEqual(docs.active_chat("a.md"), 2)
         self.assertEqual(docs.chat_session_label("a.md", 2), "Chat 2")
 
+    def test_add_chat_label_override(self):
+        # The Reader's ⚡ Summarize quick action opens each of its sessions
+        # as "Summary"; the default numbering is untouched for "+ New".
+        docs.add_chat("a.md", label="Summary")
+        self.assertEqual(docs.chat_session_label("a.md", 2), "Summary")
+        docs.add_chat("a.md")
+        self.assertEqual(docs.chat_session_label("a.md", 3), "Chat 3")
+        docs.add_chat("a.md", label="Summary")
+        self.assertEqual(docs.chat_session_label("a.md", 4), "Summary")
+        self.assertEqual(docs.chat_sessions("a.md"), [1, 2, 3, 4])
+
     def test_sessions_are_per_document(self):
         docs.add_chat("a.md")
         self.assertEqual(docs.chat_sessions("a.md"), [1, 2])
@@ -363,11 +372,11 @@ class ChatSessionRegistryTests(unittest.TestCase):
     def test_remove_session_one_drops_legacy_keys_but_not_other_sessions(self):
         docs.add_chat("a.md")  # sessions [1, 2]
         st.session_state["_chat_messages__doc__a.md"] = [{"role": "user"}]
-        st.session_state["_reader_quote__doc__a.md"] = "a passage"
+        st.session_state["_reader_quick_prompt__doc__a.md"] = "summarize"
         st.session_state["_chat_messages__chat__2__doc__a.md"] = [{"role": "user"}]
         docs.remove_chat(1, "a.md")
         self.assertNotIn("_chat_messages__doc__a.md", st.session_state)
-        self.assertNotIn("_reader_quote__doc__a.md", st.session_state)
+        self.assertNotIn("_reader_quick_prompt__doc__a.md", st.session_state)
         self.assertIn("_chat_messages__chat__2__doc__a.md", st.session_state)
         self.assertEqual(docs.chat_sessions("a.md"), [2])
         self.assertEqual(docs.active_chat("a.md"), 2)
@@ -459,17 +468,6 @@ class ChatScopingTests(unittest.TestCase):
         self.assertEqual(chat._chat_state_key("_chat_messages"), "_chat_messages")
         self.assertEqual(chat._chat_state_key("_chat_bg_task"), "_chat_bg_task")
 
-    def test_reader_and_chat_quote_keys_match(self):
-        from md_llm import reader
-
-        docs.add_document("notes.md")
-        self.assertEqual(
-            reader._reader_quote_key(), chat._staged_quote_key(),
-        )
-        self.assertEqual(
-            reader._reader_quote_key(), "_reader_quote__doc__notes.md",
-        )
-
     def test_each_doc_gets_its_own_messages_list(self):
         docs.add_document("a.md")
         st.session_state[chat._chat_state_key("_chat_messages")] = [
@@ -522,18 +520,6 @@ class ChatScopingTests(unittest.TestCase):
             st.session_state[chat._chat_state_key("_chat_messages")][0]["content"],
             "session 2 question",
         )
-
-    def test_reader_quote_key_follows_the_active_session(self):
-        from md_llm import reader
-
-        docs.add_document("notes.md")
-        docs.add_chat("notes.md")
-        self.assertEqual(
-            reader._reader_quote_key(),
-            "_reader_quote__chat__2__doc__notes.md",
-        )
-        docs.set_active_chat(1, "notes.md")
-        self.assertEqual(reader._reader_quote_key(), chat._staged_quote_key())
 
 
 class RenderDocButtonsTests(unittest.TestCase):

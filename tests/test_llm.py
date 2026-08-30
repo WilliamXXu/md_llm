@@ -134,6 +134,68 @@ class OpenAIGenerateTests(unittest.TestCase):
         self.assertNotIn("Python-urllib", ua)
 
 
+class OpenrouterListModelsTests(unittest.TestCase):
+    """list_openrouter_models reads the public /models catalog and keeps only
+    the ``:free`` ids, degrading to [] on any failure (mirrors the Ollama
+    discovery contract). The HTTP layer is stubbed like the OpenAI tests."""
+
+    def _catalog(self, *models):
+        return _ok_bytes({"data": list(models)})
+
+    def test_keeps_only_free_ids_sorted(self):
+        catalog = self._catalog(
+            {"id": "zeta/zeta-9"},
+            {"id": "minimax/minimax-m3:free"},
+            {"id": "a/b:free"},
+            {"id": "nvidia/nemotron:batch"},
+        )
+        with mock.patch("urllib.request.urlopen", return_value=catalog):
+            models = llm.list_openrouter_models()
+        self.assertEqual(models, ["a/b:free", "minimax/minimax-m3:free"])
+
+    def test_ignores_malformed_entries(self):
+        catalog = self._catalog("not-a-dict", {"no_id": True}, {"id": None})
+        with mock.patch("urllib.request.urlopen", return_value=catalog):
+            self.assertEqual(llm.list_openrouter_models(), [])
+
+    def test_missing_data_key_returns_empty(self):
+        with mock.patch(
+            "urllib.request.urlopen", return_value=_ok_bytes({"oops": 1})
+        ):
+            self.assertEqual(llm.list_openrouter_models(), [])
+
+    def test_http_error_returns_empty(self):
+        import urllib.error
+
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.HTTPError(
+                "https://openrouter.ai", 401, "no", None, io.BytesIO(b"")
+            ),
+        ):
+            self.assertEqual(llm.list_openrouter_models(), [])
+
+    def test_connection_error_returns_empty(self):
+        import urllib.error
+
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("offline"),
+        ):
+            self.assertEqual(llm.list_openrouter_models(), [])
+
+    def test_no_auth_header_sent_catalog_is_public(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["headers"] = dict(request.header_items())
+            return self._catalog()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            llm.list_openrouter_models()
+        self.assertNotIn("Authorization", captured["headers"])
+
+
 class OpencodeListModelsTests(unittest.TestCase):
     """list_opencode_models shells out to `opencode models` and degrades to []."""
 
@@ -163,6 +225,171 @@ class OpencodeListModelsTests(unittest.TestCase):
         )
         with mock.patch("subprocess.run", return_value=completed):
             self.assertEqual(llm.list_opencode_models(), [])
+
+
+# A trimmed but structurally faithful slice of `opencode models --verbose`
+# output: one bare id line per model followed by a pretty-printed metadata
+# object, with '/'-bearing strings inside the JSON (api urls) that a naive
+# line parser would mistake for id lines.
+_VERBOSE_SAMPLE = (
+    "opencode/hy3-free\n"
+    "{\n"
+    '  "id": "hy3-free",\n'
+    '  "providerID": "opencode",\n'
+    '  "api": {"url": "https://api.example.com/v1/chat"},\n'
+    '  "variants": {\n'
+    '    "low": {"reasoningEffort": "low"},\n'
+    '    "high": {"reasoningEffort": "high"}\n'
+    "  }\n"
+    "}\n"
+    "zhipuai-coding-plan/glm-5.3\n"
+    "{\n"
+    '  "id": "glm-5.3",\n'
+    '  "variants": {\n'
+    '    "low": {"reasoningEffort": "low"},\n'
+    '    "high": {"reasoningEffort": "high"},\n'
+    '    "max": {"reasoningEffort": "max"}\n'
+    "  }\n"
+    "}\n"
+    "nvidia/meta/llama-3.1-8b-instruct\n"
+    "{\n"
+    '  "id": "llama-3.1-8b-instruct",\n'
+    '  "variants": {}\n'
+    "}\n"
+    "openrouter/anthropic/claude-opus-4.8\n"
+    "{\n"
+    '  "id": "claude-opus-4.8",\n'
+    '  "variants": {\n'
+    '    "low": {"reasoning": {"effort": "low"}},\n'
+    '    "xhigh": {"reasoning": {"effort": "xhigh"}}\n'
+    "  }\n"
+    "}\n"
+)
+
+
+class OpencodeModelDetailsTests(unittest.TestCase):
+    """list_opencode_model_details parses `opencode models --verbose` JSON."""
+
+    def test_parses_id_lines_and_variant_maps(self):
+        completed = subprocess.CompletedProcess(
+            args=["opencode", "models", "--verbose"],
+            returncode=0, stdout=_VERBOSE_SAMPLE, stderr="",
+        )
+        with mock.patch("subprocess.run", return_value=completed):
+            details = llm.list_opencode_model_details()
+        self.assertEqual(set(details), {
+            "opencode/hy3-free",
+            "zhipuai-coding-plan/glm-5.3",
+            "nvidia/meta/llama-3.1-8b-instruct",
+            "openrouter/anthropic/claude-opus-4.8",
+        })
+        self.assertEqual(
+            llm.highest_opencode_variant(
+                llm.opencode_variants_for(details, "zhipuai-coding-plan/glm-5.3")
+            ),
+            "max",
+        )
+
+    def test_json_strings_with_slashes_are_not_model_ids(self):
+        completed = subprocess.CompletedProcess(
+            args=["opencode", "models", "--verbose"],
+            returncode=0, stdout=_VERBOSE_SAMPLE, stderr="",
+        )
+        with mock.patch("subprocess.run", return_value=completed):
+            details = llm.list_opencode_model_details()
+        # The api url line must stay inside hy3-free's metadata, not split it.
+        self.assertEqual(
+            details["opencode/hy3-free"]["api"]["url"],
+            "https://api.example.com/v1/chat",
+        )
+
+    def test_malformed_json_block_skipped_not_fatal(self):
+        out = (
+            "prov/broken\n"
+            "{\n"
+            '  "id": "broken",\n'  # block ends mid-object — unparsable
+            "prov/good\n"
+            "{\n"
+            '  "id": "good",\n'
+            '  "variants": {"high": {"reasoningEffort": "high"}}\n'
+            "}\n"
+        )
+        completed = subprocess.CompletedProcess(
+            args=["opencode", "models", "--verbose"],
+            returncode=0, stdout=out, stderr="",
+        )
+        with mock.patch("subprocess.run", return_value=completed):
+            details = llm.list_opencode_model_details()
+        self.assertEqual(set(details), {"prov/good"})
+
+    def test_missing_binary_returns_empty(self):
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertEqual(llm.list_opencode_model_details(), {})
+
+    def test_nonzero_exit_returns_empty(self):
+        completed = subprocess.CompletedProcess(
+            args=["opencode", "models", "--verbose"],
+            returncode=1, stdout="", stderr="unknown flag",
+        )
+        with mock.patch("subprocess.run", return_value=completed):
+            self.assertEqual(llm.list_opencode_model_details(), {})
+
+    def test_variants_for_unknown_model_and_bad_shapes(self):
+        details = {"prov/m": {"variants": "not-a-dict"}, "prov/n": {}}
+        self.assertEqual(llm.opencode_variants_for(details, "prov/m"), {})
+        self.assertEqual(llm.opencode_variants_for(details, "prov/n"), {})
+        self.assertEqual(llm.opencode_variants_for(details, "prov/other"), {})
+        self.assertEqual(llm.opencode_variants_for(None, "prov/m"), {})
+
+
+class OpencodeVariantHelpersTests(unittest.TestCase):
+    """Effort ranking: highest / ordering of an opencode variants map."""
+
+    def test_highest_picks_top_of_effort_order(self):
+        self.assertEqual(
+            llm.highest_opencode_variant(
+                {"low": {"reasoningEffort": "low"},
+                 "high": {"reasoningEffort": "high"},
+                 "max": {"reasoningEffort": "max"}}
+            ),
+            "max",
+        )
+        self.assertEqual(
+            llm.highest_opencode_variant(
+                {"minimal": {}, "low": {}, "medium": {}, "high": {},
+                 "xhigh": {"reasoningEffort": "xhigh"}}
+            ),
+            "xhigh",
+        )
+
+    def test_highest_prefers_spec_effort_over_name(self):
+        self.assertEqual(
+            llm.highest_opencode_variant({"fast": {"reasoningEffort": "max"}}),
+            "fast",
+        )
+
+    def test_highest_ignores_unknown_and_empty(self):
+        self.assertIsNone(llm.highest_opencode_variant({}))
+        self.assertIsNone(llm.highest_opencode_variant(None))
+        self.assertIsNone(llm.highest_opencode_variant({"thinking": {}}))
+        # Unknown names never beat known ones, whatever the order.
+        self.assertEqual(
+            llm.highest_opencode_variant({"thinking": {}, "high": {}}), "high"
+        )
+
+    def test_order_sorts_least_to_most_effort(self):
+        self.assertEqual(
+            llm.order_opencode_variants(
+                {"max": {}, "low": {}, "high": {}, "medium": {}}
+            ),
+            ["low", "medium", "high", "max"],
+        )
+
+    def test_order_puts_unknown_names_last_in_catalog_order(self):
+        self.assertEqual(
+            llm.order_opencode_variants({"turbo": {}, "high": {}, "thinking": {}}),
+            ["high", "turbo", "thinking"],
+        )
 
 
 class _FakeOpencodeProc:

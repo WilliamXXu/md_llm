@@ -65,10 +65,19 @@ OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
 OPENCODE_BIN = "opencode"
 OPENCODE_DEFAULT_MODEL = ""
 
-# Suggested model variants for `opencode run --variant` (provider-specific
-# reasoning effort). Not exhaustive — values vary by provider; the UI also lets
-# the user type a custom one. Used as the dropdown options in controls.
-OPENCODE_VARIANTS = ["low", "medium", "high", "minimal", "max"]
+# Reasoning-effort labels opencode uses as model variant names, ordered least →
+# most effort. `opencode models --verbose` reports each model's variants as a
+# map of name → provider options; the names come from this closed set, the
+# metadata carries no ordering, and in practice each name equals its variant's
+# effort value — so this table is what "highest effort" means. Matches the
+# catalog's own ascending presentation order (…, high, xhigh, max).
+OPENCODE_EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+# Fallback variant dropdown options for when per-model discovery is unavailable
+# (older opencode without `models --verbose`): every effort label that is a
+# valid `--variant` value, least → most effort. The UI also lets the user type
+# a custom one.
+OPENCODE_VARIANTS = [v for v in OPENCODE_EFFORT_ORDER if v != "none"]
 
 
 def _join_url(endpoint, path):
@@ -105,6 +114,31 @@ def list_ollama_models(endpoint=DEFAULT_ENDPOINT, timeout=10):
         if name:
             models.append(name)
     return models
+
+
+def list_openrouter_models(endpoint=OPENROUTER_DEFAULT_ENDPOINT, timeout=30):
+    """Return OpenRouter's free model ids from the public ``/models`` catalog.
+
+    Only the ``:free`` variants are listed — the catalog's zero-cost models
+    (their ``pricing`` fields are 0; paid models keep their bare id). The
+    catalog is public, so no API key is needed. Returns an empty list on any
+    connection / HTTP / parse error so callers (e.g. a UI selectbox) can
+    degrade gracefully to manual entry — mirrors :func:`list_ollama_models`.
+    """
+    url = _join_url(endpoint, "/models")
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+        return []
+
+    models = []
+    for entry in payload.get("data") or []:
+        model_id = entry.get("id") if isinstance(entry, dict) else None
+        if isinstance(model_id, str) and model_id.endswith(":free"):
+            models.append(model_id)
+    return sorted(models)
 
 
 def ollama_generate(
@@ -858,6 +892,123 @@ def list_opencode_models(binary=OPENCODE_BIN, timeout=20):
         if "/" in first:
             models.append(first)
     return models
+
+
+def _parse_opencode_verbose_models(text):
+    """Parse ``opencode models --verbose`` output into (id, metadata) pairs.
+
+    The output interleaves one ``provider/model`` id line per model with a
+    pretty-printed JSON metadata object, and JSON string values may themselves
+    contain '/'-bearing tokens (api urls), so blocks are consumed positionally
+    with raw_decode instead of line-splitting. Malformed blocks are skipped
+    (association resumes at the next id line); the parser is total — it never
+    raises on any input.
+    """
+    decoder = json.JSONDecoder()
+    pairs = []
+    current = None
+    pos = 0
+    n = len(text)
+    while pos < n:
+        nl = text.find("\n", pos)
+        end_of_line = n if nl == -1 else nl
+        stripped = text[pos:end_of_line].strip()
+        brace = text.find("{", pos, end_of_line) if stripped.startswith("{") else -1
+        if brace != -1:
+            try:
+                obj, pos = decoder.raw_decode(text, brace)
+                if isinstance(obj, dict):
+                    pairs.append((current, obj))
+                continue
+            except json.JSONDecodeError:
+                pos = end_of_line + 1
+                continue
+        first = stripped.split()[0] if stripped else ""
+        if first and not first.startswith('"') and "/" in first:
+            current = first
+        pos = end_of_line + 1
+    return pairs
+
+
+def list_opencode_model_details(binary=OPENCODE_BIN, timeout=20):
+    """Return per-model metadata from ``opencode models --verbose``.
+
+    Maps each ``provider/model`` id to its metadata dict; that dict's
+    ``variants`` field lists the model's reasoning-effort variants (name →
+    provider options). One subprocess call serves both model discovery and
+    per-model variant discovery. Returns {} on any failure (binary missing,
+    non-zero exit, unparsable output) so callers degrade gracefully — mirrors
+    :func:`list_opencode_models`.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "models", "--verbose"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    details = {}
+    for model_id, meta in _parse_opencode_verbose_models(proc.stdout):
+        if model_id:
+            details[model_id] = meta
+    return details
+
+
+def _variant_effort_label(name, spec):
+    """The effort label a variant ranks by: its ``reasoningEffort`` when the
+    spec carries one, else the variant name (the catalog names variants after
+    their effort level; some specs use nested ``reasoning.effort`` instead)."""
+    if isinstance(spec, dict) and spec.get("reasoningEffort"):
+        return str(spec["reasoningEffort"])
+    return name
+
+
+def _effort_rank(label):
+    try:
+        return OPENCODE_EFFORT_ORDER.index(label)
+    except ValueError:
+        return -1
+
+
+def opencode_variants_for(details, model_id):
+    """Return ``model_id``'s variants map from :func:`list_opencode_model_details`
+    output ({} when the model is unknown or its variants are absent/malformed)."""
+    meta = details.get(model_id) if isinstance(details, dict) else None
+    variants = meta.get("variants") if isinstance(meta, dict) else None
+    return variants if isinstance(variants, dict) else {}
+
+
+def order_opencode_variants(variants):
+    """Return ``variants``' names sorted least → most effort for a dropdown.
+
+    Names outside :data:`OPENCODE_EFFORT_ORDER` (non-effort toggles like
+    ``thinking``) keep catalog order at the end.
+    """
+    floor = len(OPENCODE_EFFORT_ORDER)
+    decorated = []
+    for index, (name, spec) in enumerate((variants or {}).items()):
+        rank = _effort_rank(_variant_effort_label(name, spec))
+        decorated.append((rank if rank >= 0 else floor, index, name))
+    decorated.sort()
+    return [name for _, _, name in decorated]
+
+
+def highest_opencode_variant(variants):
+    """Return the highest-effort variant name in ``variants``, or None.
+
+    Ranks each name by its effort label against :data:`OPENCODE_EFFORT_ORDER`
+    and returns the first top-ranked entry. Returns None when nothing ranks
+    (no variants, or only non-effort names like ``thinking``) — the caller
+    should then omit ``--variant``.
+    """
+    best, best_rank = None, -1
+    for name, spec in (variants or {}).items():
+        rank = _effort_rank(_variant_effort_label(name, spec))
+        if rank > best_rank:
+            best, best_rank = name, rank
+    return best
 
 
 def opencode_chat_stream(

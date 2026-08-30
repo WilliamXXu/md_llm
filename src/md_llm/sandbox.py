@@ -14,7 +14,7 @@ cwd-scoping into an OS-enforced sandbox:
   directories are garbage-collected by age (:data:`STALE_AFTER_S`) whenever a
   new one is created (after use). ``clear_sandbox`` wipes one immediately.
 - **No leakage from host folders**: the generated Seatbelt profile denies file
-  *reads* of everything under core.base_dir's parent (uploads, chat history,
+  *reads* of everything under core.base_dir (transcripts, chat history,
   settings), of credential stores (~/.ssh, ~/.gnupg, ...), and of the classic
   personal-data trees (Desktop/Documents/Downloads, media folders, Mail,
   Messages, browser profiles, iCloud Drive). It denies file *writes* everywhere
@@ -22,6 +22,10 @@ cwd-scoping into an OS-enforced sandbox:
   need. Outbound network stays open so the agent can reach its model provider.
   Seatbelt rules are last-match-wins, so the sandbox itself is re-allowed
   after the blanket denies (a custom workdir inside a denied tree still works).
+  When core.base_dir is directly under ~ (e.g. ~/local_transcriber), this
+  avoids denying the entire home directory — only the data tree is walled off,
+  so opencode's own runtime files remain accessible without extra allow-list
+  maintenance.
 
 Profiles are written per run to a private temp file (the pinned sandbox path
 differs between sessions) and deleted by the caller when the run ends; see
@@ -152,7 +156,8 @@ def new_session_sandbox(label, max_age_s=STALE_AFTER_S):
 _PROFILE_TEMPLATE = """\
 ;; md_llm OpenCode agent sandbox — generated, do not edit.
 ;; Last match wins: blanket write deny, then scratch-space allows;
-;; host-tree/credential read denies, then this sandbox re-allowed.
+;; host-tree/credential read denies, then the agent's own dirs + this
+;; sandbox re-allowed.
 (version 1)
 (allow default)
 
@@ -161,14 +166,19 @@ _PROFILE_TEMPLATE = """\
    (subpath "{sandbox}")
    (subpath "/private/var/folders")
    (subpath "/var/folders")
+   (subpath "/private/tmp")
+   (subpath "/tmp")
    (literal "/dev/null")
    (subpath "{home}/.local/share/opencode")
+   (subpath "{home}/.local/state/opencode")
+   (subpath "{home}/.cache/opencode")
    (subpath "{home}/.config/opencode")
+   (subpath "{home}/.opencode")
    (subpath "{home}/.cache")
    (subpath "{home}/Library/Caches"))
 
 (deny file-read*
-   (subpath "{host_root}")
+   (subpath "{base_dir}")
    (subpath "{home}/.ssh")
    (subpath "{home}/.gnupg")
    (subpath "{home}/.aws")
@@ -188,6 +198,16 @@ _PROFILE_TEMPLATE = """\
    (subpath "{home}/Library/Mobile Documents")
    (subpath "{home}/Library/Application Support/Google/Chrome")
    (subpath "{home}/Library/Application Support/Firefox"))
+;; Re-allow sandbox and opencode runtime dirs after the deny
+;; (last-match-wins): a custom workdir inside the data tree still works,
+;; and opencode can read its own db/auth/lock trees. The auth token is
+;; intentionally included — the agent runs AS opencode.
+(allow file-read*
+   (subpath "{home}/.local/share/opencode")
+   (subpath "{home}/.local/state/opencode")
+   (subpath "{home}/.cache/opencode")
+   (subpath "{home}/.config/opencode")
+   (subpath "{home}/.opencode"))
 (allow file-read* (subpath "{sandbox}"))
 
 (allow network*)
@@ -199,19 +219,25 @@ def seatbelt_profile(workdir):
 
     Writes land only in the workdir plus the per-user macOS temp/cache tree
     (/var/folders, where TMPDIR and ~/Library/Caches live), opencode's own
-    state directories and /dev/null; reads are denied for the host's data
-    tree, typical credential stores, and personal-data folders (Desktop,
-    Documents, Downloads, media, Mail/Messages, browser profiles, iCloud
-    Drive), then re-allowed for the workdir itself (Seatbelt rules apply
-    last-match-wins). Reads of system/tooling paths stay open — node/python
-    need them — but private user data cannot be read, so nothing can be
-    copied out or exfiltrated from it.
+    state directories, /tmp and /dev/null; reads are denied for the host's
+    data tree (core.base_dir), typical credential stores, and personal-data
+    folders (Desktop, Documents, Downloads, media, Mail/Messages, browser
+    profiles, iCloud Drive), then re-allowed for the workdir itself and for
+    opencode's own runtime dirs (Seatbelt rules apply last-match-wins). The
+    narrow base_dir deny (instead of its parent) avoids walling off the entire
+    home directory when the data root lives directly under ~ (e.g.
+    ~/local_transcriber), which previously required an extra allow-list for
+    opencode's own files and still broke on missing entries. Reads of
+    system/tooling paths stay open — node/python need them — but private user
+    data cannot be read, so nothing can be copied out or exfiltrated from it.
     """
     home = os.path.expanduser("~")
     return _PROFILE_TEMPLATE.format(
         sandbox=os.path.abspath(workdir).rstrip("/") or "/",
         home=home,
-        host_root=_host_root(),
+        base_dir=os.path.abspath(get_core().base_dir),
+        # Keep host_root for backwards-compat if template still references it
+        host_root=os.path.dirname(os.path.abspath(get_core().base_dir)),
     )
 
 

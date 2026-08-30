@@ -4,8 +4,10 @@ A host stages a file by calling :func:`open_in_reader` (which records the target
 in session state and switches the host's active tab here). With ``keep_open=True``
 the file joins the open-documents registry and becomes the active one — each
 open document gets its own Reader view and an independent LLM chat (see
-:mod:`md_llm.docs`). The panel renders the file, offers copy-to-clipboard, and
-lets the user quote a passage to send to the chat.
+:mod:`md_llm.docs`). The panel renders the file, offers copy-to-clipboard and
+a one-click **⚡ Summarize** quick action (left of Copy: opens a new "Summary"
+tab in the LLM chat and sends the whole document there with an editable
+summary prompt).
 
 Path safety: the staged relpath is resolved against ``core.base_dir`` and the
 resulting absolute path must sit inside one of ``core.markdown_dirs``; anything
@@ -13,7 +15,6 @@ that escapes via ``..`` is rejected before being read.
 
 Shared session-state keys (the integration contract the host honors):
   - ``_reader_target``  — the relpath to display (written by open_in_reader).
-  - ``_reader_quote``   — a passage staged for the next chat question.
   - ``TABS_KEY`` / ``READER_TAB_LABEL`` / ``CHAT_TAB_LABEL`` — tab switching.
 """
 
@@ -40,10 +41,29 @@ from .state import (
 # Session-state key holding the reader target (a relpath against core.base_dir).
 _READER_TARGET = "_reader_target"
 
-# A passage staged in the Reader to attach to the next chat question. Shared by
-# string literal (the chat panel reads "_reader_quote" too) rather than an
-# import, to keep reader↔chat decoupled.
-_READER_QUOTE = "_reader_quote"
+# The ⚡ Summarize quick action's prompt, staged for the NEXT chat turn of the
+# ACTIVE document + chat session. Shared by string literal (the chat panel
+# reads "_reader_quick_prompt" too) rather than an import, to keep reader↔chat
+# decoupled. The chat panel pops it and sends it through the normal chat
+# pipeline (see chat._send_staged_quick_prompt).
+_READER_QUICK_PROMPT = "_reader_quick_prompt"
+
+# The ⚡ Summarize quick action's default prompt. The user can edit it in the
+# Reader's "Quick summarize prompt" expander; this constant is the factory
+# default the editor seeds and its "Reset to default" restores.
+QUICK_SUMMARY_PROMPT = (
+    "你是一个摘要助手，请概括给定文本。规则：1. 若原文为英文，则用英文输出；"
+    "否则一律用简体中文。2. 平衡原文的行文顺序和你的结构化输出，考虑使用bullet "
+    "points/表格/executive summary 3. 保持客观，不得添加原文没有的信息"
+)
+
+# The quick-prompt editor's widget key. Streamlit prunes unmounted widget keys
+# on Reader↔chat view switches, so edits are mirrored into _QUICK_PROMPT_SAVED
+# (an ordinary, non-pruned session key) by an on_change callback; on remount
+# the editor re-seeds from the mirror — the same trick as the chat panel's
+# control snapshot (_chat_controls_snapshot).
+_QUICK_PROMPT_EDIT = "_reader_quick_prompt_edit"
+_QUICK_PROMPT_SAVED = "_reader_quick_prompt_saved"
 
 # A heading the sidebar table of contents wants to jump to, staged as the
 # DOM-matching signature "H<level>|<normalized title>" (see _inject_toc_jump).
@@ -143,27 +163,39 @@ def _toc_auto_open(roots):
         return {roots[0]["id"]}
     return set()
 
-# The text_area widget key for the quote box (Reader-internal).
-_READER_QUOTE_AREA = "_reader_quote_area"
+def _reader_quick_prompt_key():
+    """Session key of the ⚡ Summarize prompt staged for the ACTIVE session.
 
-
-def _reader_quote_key():
-    """Session key of the quote staged for the ACTIVE chat session.
-
-    Scoped per document AND per chat session (see :mod:`md_llm.docs`) so a
-    passage quoted from one document can never attach to another's
-    conversation, and a quote always lands in the chat session that was active
-    when it was staged. Falls back to the legacy bare key in single-document
-    mode with a single session.
+    Scoped per document AND per chat session, so a prompt staged from one
+    document's Reader can never fire into another document's conversation
+    (chat.py resolves the same key the same way). The ⚡ button stages into the
+    chat session it just opened for the summary (docs.add_chat activates it),
+    so reader and chat always agree on the target.
     """
     doc = docs.active_document()
-    return docs.chat_key(_READER_QUOTE, docs.active_chat(doc), doc)
+    return docs.chat_key(_READER_QUICK_PROMPT, docs.active_chat(doc), doc)
 
 
-def _reader_quote_area_key():
-    """Session key of the quote textarea widget for the ACTIVE chat session."""
-    doc = docs.active_document()
-    return docs.chat_key(_READER_QUOTE_AREA, docs.active_chat(doc), doc)
+def _save_quick_prompt_edit():
+    """on_change for the quick-prompt editor: mirror the edit into the mirror key.
+
+    The mirror (_QUICK_PROMPT_SAVED) is a non-widget key, so it survives the
+    view switches that prune the textarea itself; the ⚡ button reads it.
+    """
+    st.session_state[_QUICK_PROMPT_SAVED] = (
+        st.session_state.get(_QUICK_PROMPT_EDIT, "")
+    )
+
+
+def _current_quick_prompt():
+    """The prompt the ⚡ Summarize button will send.
+
+    The edited copy when there is one, else the factory default. Stripped;
+    empty means "cleared by the user — refuse to send".
+    """
+    return (
+        st.session_state.get(_QUICK_PROMPT_SAVED) or QUICK_SUMMARY_PROMPT
+    ).strip()
 
 
 # The st.tabs() key in the host app — writing its session-state value switches
@@ -503,11 +535,75 @@ def render_reader():
         f"{kind}: `{_display_name_for_filepath(target)}`  ·  {size}  ·  "
         f"`{os.path.abspath(target)}`"
     )
-    col_copy, col_clear = st.columns([1, 1])
+    # --- Quick action + copy + clear ------------------------------------
+    # ⚡ Summarize (the quick action, left of Copy) opens a NEW "Summary" chat
+    # session tab for the active document (docs.add_chat activates it), stages
+    # the editable summary prompt into that session, and jumps to the LLM chat,
+    # which sends it through the normal chat pipeline with the panel's existing
+    # provider/model settings — the full document always goes along as context.
+    col_quick, col_copy, col_clear = st.columns([1, 1, 1])
+    with col_quick:
+        if st.button(
+            "⚡ Summarize",
+            type="primary",
+            key="_reader_quick_summarize_btn",
+            help=(
+                "Quick action: open a new 'Summary' tab in the LLM chat and "
+                "send this document there with the summarize prompt (the "
+                "chat panel's existing provider/model settings are used "
+                "as-is). Edit the prompt in the 'Quick summarize prompt' "
+                "expander below."
+            ),
+        ):
+            prompt = _current_quick_prompt()
+            if not prompt:
+                st.warning(
+                    "The quick summarize prompt is empty — edit it in the "
+                    "'Quick summarize prompt' expander below (or reset it) "
+                    "and try again."
+                )
+            else:
+                # A dedicated session per request: summaries never mix with an
+                # ongoing conversation. add_chat activates the new session, so
+                # the staged key below — and the chat panel's own key
+                # resolution — both point at it.
+                docs.add_chat(docs.active_document(), label="Summary")
+                st.session_state[_reader_quick_prompt_key()] = prompt
+                st.session_state[TABS_KEY] = CHAT_TAB_LABEL
+                st.rerun()
     with col_copy:
         _copy_text_button(text)
     with col_clear:
         st.button("Clear", on_click=_close_reader, key="_reader_close_doc_btn")
+
+    # --- Quick summarize prompt (the ⚡ button's payload) ----------------
+    # Sits at the top of the panel, next to the button that uses it. The
+    # textarea is the modifiable copy of the factory default: it is seeded
+    # pre-mount from the non-widget mirror (never with value=, which would
+    # trip Streamlit's default-value-vs-session-state policy once the key
+    # exists) and every edit is mirrored back via on_change, so the prompt
+    # survives Reader↔chat view switches.
+    with st.expander("Quick summarize prompt", expanded=False):
+        st.caption(
+            "_**⚡ Summarize** opens a new **Summary** tab in the LLM chat and "
+            "sends this document there using this prompt — the full document "
+            "is attached as context, and the chat panel's provider/model "
+            "settings are used as-is. Edits stick for this browser session._"
+        )
+        if _QUICK_PROMPT_EDIT not in st.session_state:
+            st.session_state[_QUICK_PROMPT_EDIT] = st.session_state.get(
+                _QUICK_PROMPT_SAVED, QUICK_SUMMARY_PROMPT
+            )
+        st.text_area(
+            "Prompt",
+            key=_QUICK_PROMPT_EDIT,
+            height=150,
+            on_change=_save_quick_prompt_edit,
+        )
+        if st.button("Reset to default", key="_reader_quick_prompt_reset"):
+            st.session_state.pop(_QUICK_PROMPT_SAVED, None)
+            st.session_state.pop(_QUICK_PROMPT_EDIT, None)
+            st.rerun()
 
     # Permanently bump body-text + code font size. Scoped to Streamlit's
     # markdown/code containers so widget labels, buttons, and headers keep their
@@ -531,58 +627,24 @@ def render_reader():
         _inject_toc_jump(jump)
         st.session_state.pop(_TOC_JUMP, None)
 
-    # --- Quote a passage into the chat ---------------------------------
-    # The content above is read-only DOM: Streamlit never sees the browser's
-    # text selection. So the user selects text, copies it (⌘C / Ctrl-C), pastes
-    # it here, and "Send to chat" stages it for the next question in the chat
-    # panel — alongside the full document, which is always sent as context.
-    st.divider()
-    with st.expander("Quote a passage for the LLM chat", expanded=False):
-        _sess_label = docs.chat_session_label(
-            docs.active_document(), docs.active_chat(docs.active_document())
-        )
-        st.caption(
-            "_Select text above, copy it, paste it here, then **Send to chat**. "
-            f"The quote is attached to your next question in "
-            f"**{_sess_label}** — the full document is still sent as context "
-            "too._"
-        )
-        st.text_area(
-            "Quote for chat",
-            value=st.session_state.get(_reader_quote_key(), ""),
-            height=120, key=_reader_quote_area_key(),
-            placeholder="Paste the passage you want to ask about…",
-        )
-        col_send, col_clear = st.columns([1, 1])
-        if col_send.button("Send to chat", type="primary"):
-            quote = (st.session_state.get(_reader_quote_area_key()) or "").strip()
-            if quote:
-                st.session_state[_reader_quote_key()] = quote
-                st.session_state[TABS_KEY] = CHAT_TAB_LABEL
-                st.rerun()
-            else:
-                st.warning("Paste a passage into the box first.")
-        if col_clear.button("Clear", key="_reader_clear_quote_btn"):
-            st.session_state.pop(_reader_quote_key(), None)
-            st.session_state[_reader_quote_area_key()] = ""
-            st.rerun()
-
 
 def _close_reader():
     """Drop the active document (wired as the "Clear" button's on_click).
 
     In multi-document mode the document is removed from the registry — its
     chat state is dropped and the next open document becomes active, so a
-    passage quoted from one document can't leak into a chat about another. In
-    single-document mode the reader target (and any staged quote) is cleared.
+    staged quick prompt from one document can't leak into a chat about
+    another. In single-document mode the reader target (and any staged quick
+    prompt) is cleared.
     """
     doc = docs.active_document()
     if doc:
         docs.remove_document(doc)
     else:
         st.session_state.pop(_READER_TARGET, None)
-        # In single-document mode, clear the staged quotes of every chat
-        # session of this (now closed) document.
+        # In single-document mode, clear the staged quick prompt (legacy bare
+        # key shared by every chat session of this now-closed document).
         for sid in docs.chat_sessions(""):
-            st.session_state.pop(docs.chat_key(_READER_QUOTE, sid, ""), None)
-            st.session_state.pop(docs.chat_key(_READER_QUOTE_AREA, sid, ""), None)
+            st.session_state.pop(
+                docs.chat_key(_READER_QUICK_PROMPT, sid, ""), None
+            )

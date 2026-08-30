@@ -10,14 +10,20 @@ this module is host-agnostic.
 Three providers, toggled by a radio:
   - **Ollama**: a local server; models auto-discovered via /api/tags.
   - **OpenRouter**: a hosted API; API key defaults to OPENROUTER_API_KEY.
+    The Model dropdown auto-populates with the catalog's current free models
+    (``GET /models`` — public, fetched once per session, Refresh to re-fetch).
+    The last-used model and endpoint URL are memorized in settings (the API
+    key stays write-only — session memory, never persisted).
   - **OpenAI-compatible**: a generic OpenAI Chat Completions API. Models AND the
     API key are remembered PER endpoint URL (the ``oai_endpoints`` registry), so
     switching endpoints restores the matching model list + key.
   - **OpenCode**: the open source coding AGENT, invoked as a subprocess
     (``opencode run --format json --auto``). No API key (auth is out-of-band
     via ``opencode auth login`` / env); instead it exposes a working directory,
-    an optional ``--attach`` server URL, and an optional agent. Models come from
-    ``opencode models`` (cached per session with a Refresh button).
+    an optional ``--attach`` server URL, and an optional agent. Models — and
+    each model's reasoning-effort variants — come from one
+    ``opencode models --verbose`` call (cached per session with a Refresh
+    button); the variant dropdown defaults to the model's highest effort.
 
 The controls are prefix-namespaced (``prefix`` arg) so several panels can each
 keep independent values without their Streamlit widget keys colliding — the chat
@@ -135,6 +141,89 @@ def _remember_openrouter_model(model):
     _remember_model(
         model, "llm_or_models", "llm_or_model_sel", "_pending_or_model_sel",
     )
+
+
+def _remember_openrouter_endpoint(endpoint):
+    """Persist the last-used OpenRouter endpoint URL to settings.
+
+    Stored under ``llm_or_endpoint``; the endpoint text input mounts with that
+    key's value (falling back to ``llm.OPENROUTER_DEFAULT_ENDPOINT``), so the
+    memorized choice reopens next session. Empty values are ignored. Called on
+    every OpenRouter send — the sibling of ``_remember_oai_endpoint`` for the
+    OpenAI-compatible provider and ``_remember_opencode_model`` for OpenCode.
+    """
+    endpoint = (endpoint or "").strip()
+    if not endpoint:
+        return
+    settings = get_core().load_settings()
+    llm_s = dict(settings.get("llm") or {})
+    llm_s["llm_or_endpoint"] = endpoint
+    settings["llm"] = llm_s
+    get_core().save_settings(settings)
+
+
+def _seed_openrouter_last_model(saved_llm, prefix=""):
+    """Seed the model selectbox with the memorized last-used OpenRouter model.
+
+    Copies the ``llm_or_model_sel`` settings key (written by
+    :func:`_remember_openrouter_model` on every send) into the selectbox's
+    session key so a fresh mount reopens on the memorized choice instead of
+    the factory default — mirroring the OpenCode branch's last-model seeding.
+    Only fills an ABSENT key: a selection already made this run (e.g. restored
+    from the chat panel's control snapshot) always wins. Returns the seeded
+    model ("" when nothing was seeded); the caller must ensure the returned
+    value is among the selectbox's options — a stale memorized model is
+    prepended there, exactly like a live selection that left the option list.
+    """
+    key = f"{prefix}llm_or_model_sel"
+    if st.session_state.get(key):
+        return ""
+    saved = saved_llm.get("llm_or_model_sel", "")
+    if saved:
+        st.session_state[key] = saved
+    return saved
+
+
+# Session-state key of OpenRouter's per-session free-model catalog cache (see
+# :func:`_openrouter_cached_models`). Lives outside the chat panel's snapshot
+# prefixes on purpose: it's a cache, not a user choice.
+_OPENROUTER_MODELS_CACHE_KEY = "_openrouter_models_cache"
+
+
+def _openrouter_cached_models(endpoint=llm.OPENROUTER_DEFAULT_ENDPOINT):
+    """Return OpenRouter's free-model catalog, fetched once per session.
+
+    ``GET /models`` is a remote HTTPS call (~1 MB catalog), so the result is
+    cached in session_state — mirroring the OpenCode discovery cache — and
+    refreshed on demand via the Refresh button in the OpenRouter controls; a
+    fresh browser session re-fetches automatically, so the list tracks the
+    live catalog without paying a round trip on every rerun. [] means the
+    fetch failed (offline, endpoint down) and the dropdown degrades to the
+    factory default + remembered history until a Refresh succeeds.
+    """
+    cache = st.session_state.get(_OPENROUTER_MODELS_CACHE_KEY)
+    if cache is None:
+        cache = llm.list_openrouter_models(endpoint)
+        st.session_state[_OPENROUTER_MODELS_CACHE_KEY] = cache
+    return list(cache)
+
+
+def _openrouter_dropdown_options(saved_llm, discovered):
+    """Build the OpenRouter Model dropdown's option list.
+
+    Order: the factory default first (it stays the default selection when
+    nothing is memorized), then the remembered model history, then the
+    discovered free-model catalog (see :func:`_openrouter_cached_models`), and
+    the manual-entry escape hatch last. De-duplicated, order-preserving.
+    """
+    models = _openrouter_model_history(saved_llm)
+    if not any(m == llm.OPENROUTER_DEFAULT_MODEL for m in models):
+        models = [llm.OPENROUTER_DEFAULT_MODEL] + models
+    merged: list[str] = []
+    for m in list(models) + list(discovered or []):
+        if isinstance(m, str) and m and m not in merged:
+            merged.append(m)
+    return merged + ["(other — type below)"]
 
 
 def _instruction_history(saved_llm):
@@ -296,16 +385,37 @@ def _remember_oai_endpoint(endpoint):
 # OpenCode is not an LLM API — it's an agent CLI (`opencode run`). So its
 # controls look different from the HTTP providers: there's no API key (auth is
 # done out-of-band via `opencode auth login` / env), and there's a working
-# directory the agent operates in. Models come from `opencode models` (cached
-# per session + a Refresh button, since it's a subprocess call).
+# directory the agent operates in. Models — and each model's reasoning-effort
+# variants — come from one `opencode models --verbose` call (cached per session
+# + a Refresh button, since it's a subprocess call); the variant dropdown shows
+# the selected model's real variants and defaults to the highest effort.
+
+def _opencode_cached_details():
+    """Return opencode's per-model metadata, memoized in session_state.
+
+    ``opencode models --verbose`` is a subprocess call, so the result is cached
+    in session_state and refreshed on demand via the Refresh button in
+    :func:`_render_opencode_controls`. {} means discovery is unavailable (old
+    opencode, binary missing) and the UI falls back to static presets.
+    """
+    cache = st.session_state.get("_opencode_model_details_cache")
+    if cache is None:
+        cache = llm.list_opencode_model_details()
+        st.session_state["_opencode_model_details_cache"] = cache
+    return cache
+
 
 def _opencode_cached_models():
     """Return opencode's model list, memoized in session_state per session.
 
-    ``opencode models`` is a subprocess call, so the result is cached in
-    session_state and refreshed on demand via the Refresh button in
-    :func:`_render_opencode_controls`.
+    Derived from the ``opencode models --verbose`` metadata cache when that
+    succeeds (one subprocess call feeds both the model dropdown and the
+    per-model variant options); falls back to the plain ``opencode models``
+    table when verbose discovery fails (older opencode).
     """
+    details = _opencode_cached_details()
+    if details:
+        return list(details.keys())
     cache = st.session_state.get("_opencode_models_cache")
     if cache is None:
         cache = llm.list_opencode_models()
@@ -332,7 +442,9 @@ def _current_opencode_variant(prefix=""):
 
     ``prefix`` selects which set of widget keys to read. Returns the custom
     value when "(other — type below)" is selected, the dropdown selection when a
-    concrete variant is picked, and None for "(none)" / unset.
+    concrete variant is picked, and None for "(none)" / unset. The dropdown's
+    default (highest effort for the selected model) is seeded when the widget
+    renders, so an untouched panel resolves to that default here.
     """
     p = prefix
     sel = st.session_state.get(f"{p}llm_opencode_variant_sel")
@@ -341,6 +453,46 @@ def _current_opencode_variant(prefix=""):
     if sel and sel != "(none)":
         return sel
     return None
+
+
+def _selected_opencode_model(prefix):
+    """The model id the OpenCode panel currently targets ('' when unresolved).
+
+    Reads the model dropdown's key (instantiated by the time the variant
+    controls render), or the custom-name input when "(other — type below)" is
+    selected.
+    """
+    sel = st.session_state.get(f"{prefix}llm_opencode_model_sel")
+    if sel == "(other — type below)":
+        return (st.session_state.get(f"{prefix}llm_opencode_model") or "").strip()
+    return sel or ""
+
+
+def _opencode_variant_options(details, model_id):
+    """Compute the Model variant dropdown's (options, default selection).
+
+    With per-model variants discovered via ``opencode models --verbose``, the
+    options are that model's real variants sorted least → most effort and the
+    default is the highest one ("default to highest effort"). A model known to
+    have no variants gets only the escape hatches — passing ``--variant`` to a
+    variant-less model errors at runtime. When discovery is unavailable at all
+    ({} details), falls back to the static presets in
+    :data:`llm.OPENCODE_VARIANTS`.
+    """
+    if details:
+        variants = llm.opencode_variants_for(details, model_id)
+        if variants:
+            return (
+                ["(none)"] + llm.order_opencode_variants(variants)
+                + ["(other — type below)"],
+                llm.highest_opencode_variant(variants),
+            )
+        if model_id:
+            return ["(none)", "(other — type below)"], "(none)"
+    return (
+        ["(none)"] + list(llm.OPENCODE_VARIANTS) + ["(other — type below)"],
+        "(none)",
+    )
 
 
 # The OpenCode "clear sandbox" button key. It is suffixed per panel
@@ -354,13 +506,16 @@ OPENCODE_CLEAR_SANDBOX_KEY = "_opencode_clear_sandboxchat"
 
 
 def _render_opencode_controls(prefix, saved_llm):
-    """Render the OpenCode provider's model / sandbox / attach / agent controls.
+    """Render the OpenCode provider's model / variant / sandbox / agent controls.
 
     Models are merged from ``opencode models`` (cached) and the user's
-    previously-used list. By default the agent runs in a hardened per-chat
-    sandbox (:mod:`md_llm.sandbox`): a fresh, Seatbelt-confined directory that
-    no other session can see. The user may override the workdir to point at a
-    real project; the confinement toggle still applies.
+    previously-used list; each model's reasoning-effort variants come from the
+    same ``opencode models --verbose`` metadata, and the variant dropdown
+    defaults to the model's highest effort. By default the agent runs in a
+    hardened per-chat sandbox (:mod:`md_llm.sandbox`): a fresh, Seatbelt-
+    confined directory that no other session can see. The user may override
+    the workdir to point at a real project; the confinement toggle still
+    applies.
     """
     p = prefix
 
@@ -394,6 +549,7 @@ def _render_opencode_controls(prefix, saved_llm):
     )
     if scol2.button("Refresh", key=f"_opencode_refresh{p.rstrip('_')}"):
         st.session_state.pop("_opencode_models_cache", None)
+        st.session_state.pop("_opencode_model_details_cache", None)
         st.rerun()
     if st.session_state.get(f"{p}llm_opencode_model_sel") == "(other — type below)":
         st.text_input(
@@ -402,11 +558,26 @@ def _render_opencode_controls(prefix, saved_llm):
             key=f"{p}llm_opencode_model",
         )
 
-    variant_options = ["(none)"] + list(llm.OPENCODE_VARIANTS) + ["(other — type below)"]
+    # Variant options follow the selected model (the dropdown key is populated
+    # by the selectbox above, custom names included). Seed the default — the
+    # model's highest-effort variant — on first render, and reset a stale
+    # choice the current model no longer offers.
+    variant_options, variant_default = _opencode_variant_options(
+        _opencode_cached_details(), _selected_opencode_model(p)
+    )
+    vkey = f"{p}llm_opencode_variant_sel"
+    if st.session_state.get(vkey) not in variant_options:
+        st.session_state[vkey] = variant_default
     st.selectbox(
         "Model variant",
         variant_options,
-        key=f"{p}llm_opencode_variant_sel",
+        key=vkey,
+        help=(
+            "Reasoning effort passed to `opencode run --variant`. Options are "
+            "the selected model's own variants (via `opencode models "
+            "--verbose`); the highest one is preselected. \"(none)\" omits "
+            "the flag and uses opencode's per-model default."
+        ),
     )
     if st.session_state.get(f"{p}llm_opencode_variant_sel") == "(other — type below)":
         st.text_input(
@@ -643,18 +814,28 @@ def _render_llm_controls(prefix="", show_instruction=True):
             value=saved_llm.get("llm_or_endpoint", llm.OPENROUTER_DEFAULT_ENDPOINT),
             key=f"{p}llm_or_endpoint",
         )
-        models = _openrouter_model_history(saved_llm)
-        if not any(m == llm.OPENROUTER_DEFAULT_MODEL for m in models):
-            models = [llm.OPENROUTER_DEFAULT_MODEL] + models
-        options = models + ["(other — type below)"]
+        # Live free-model catalog: fetched once per session (Refresh re-fetches),
+        # merged with the remembered history so both stay selectable.
+        discovered = _openrouter_cached_models(
+            st.session_state.get(
+                f"{p}llm_or_endpoint", llm.OPENROUTER_DEFAULT_ENDPOINT
+            )
+        )
+        options = _openrouter_dropdown_options(saved_llm, discovered)
         sel = st.session_state.get(f"{p}llm_or_model_sel")
+        if not sel:
+            sel = _seed_openrouter_last_model(saved_llm, p)
         if sel and sel not in options:
             options = [sel] + options
-        st.selectbox(
+        scol1, scol2 = st.columns([4, 1])
+        scol1.selectbox(
             "Model",
             options,
             key=f"{p}llm_or_model_sel",
         )
+        if scol2.button("Refresh", key=f"_openrouter_refresh{p.rstrip('_')}"):
+            st.session_state.pop(_OPENROUTER_MODELS_CACHE_KEY, None)
+            st.rerun()
         if st.session_state.get(f"{p}llm_or_model_sel") == "(other — type below)":
             st.text_input(
                 "Custom model name",

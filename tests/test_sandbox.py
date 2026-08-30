@@ -92,9 +92,9 @@ class SandboxTests(unittest.TestCase):
 
     def test_profile_blocks_host_tree_and_credentials_but_reallows_sandbox(self):
         profile = sandbox.seatbelt_profile("/tmp/wk/a-b1234")
-        host_root = os.path.dirname(os.path.abspath(self.base_dir))
+        base_dir = os.path.abspath(self.base_dir)
         home = os.path.expanduser("~")
-        self.assertIn(f'(subpath "{host_root}")', profile)
+        self.assertIn(f'(subpath "{base_dir}")', profile)
         self.assertIn(f'{home}/.ssh', profile)
         self.assertIn(f'{home}/Library/Keychains', profile)
         # personal-data trees are denied wholesale
