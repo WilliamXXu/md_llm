@@ -7,7 +7,7 @@ worker, autopilot, LLM-output grid). Every persistence call goes through the
 injected Core (:func:`md_llm.core.get_core`) instead of a host ``tl`` module, so
 this module is host-agnostic.
 
-Three providers, toggled by a radio:
+Five providers, toggled by a radio:
   - **Ollama**: a local server; models auto-discovered via /api/tags.
   - **OpenRouter**: a hosted API; API key defaults to OPENROUTER_API_KEY.
     The Model dropdown auto-populates with the catalog's current free models
@@ -24,6 +24,16 @@ Three providers, toggled by a radio:
     each model's reasoning-effort variants — come from one
     ``opencode models --verbose`` call (cached per session with a Refresh
     button); the variant dropdown defaults to the model's highest effort.
+  - **Cline**: the Cline coding AGENT CLI, also invoked as a subprocess
+    (``cline --json "prompt"``, tools auto-approved). No API key (auth is
+    out-of-band via ``cline auth``); it exposes a working directory and a
+    reasoning-effort ``--thinking`` level (a closed set advertised by the CLI,
+    so no discovery subprocess is needed). The CLI has no model-list command,
+    but Cline's provider API exposes a public catalog whose zero-cost models
+    carry a ``:free`` suffix — the Model dropdown auto-populates with those
+    (fetched once per session, Refresh to re-fetch) on top of remembered
+    history, with an "(default)" option that uses Cline's own configured
+    model.
 
 The controls are prefix-namespaced (``prefix`` arg) so several panels can each
 keep independent values without their Streamlit widget keys colliding — the chat
@@ -85,6 +95,11 @@ def _current_llm_model(prefix=""):
         if sel and sel != "(other — type below)":
             return sel.strip()
         return st.session_state.get(f"{p}llm_opencode_model", "").strip()
+    if provider == "Cline":
+        sel = st.session_state.get(f"{p}llm_cline_model_sel")
+        if sel and sel not in ("(other — type below)", CLINE_DEFAULT_MODEL_LABEL):
+            return sel.strip()
+        return st.session_state.get(f"{p}llm_cline_model", "").strip()
     sel = st.session_state.get(f"{p}llm_model_sel")
     if sel == "(other — type below)":
         return st.session_state.get(f"{p}llm_model_custom", "").strip()
@@ -637,6 +652,181 @@ def _render_opencode_controls(prefix, saved_llm):
     )
 
 
+# --- Cline (coding agent CLI, subprocess path) -------------------------------
+#
+# Cline mirrors the OpenCode controls where the concepts match (hardened
+# sandbox, working directory, per-chat sandbox clearing) and diverges where
+# the CLI does: there is no `cline models` discovery subprocess, so the model
+# is a remembered-history selectbox with an explicit "(default …)" option that
+# omits --model (Cline then uses whatever `cline auth` configured), and the
+# reasoning-effort knob is --thinking — a closed set the CLI advertises, so
+# the dropdown is static instead of discovered per model.
+
+# Selectbox option meaning "pass no --model; use the model Cline was
+# configured with via `cline auth`". Resolves to "" in _current_llm_model.
+CLINE_DEFAULT_MODEL_LABEL = "(default — configured via cline auth)"
+
+# The Cline "clear sandbox" button key — suffixed per panel exactly like
+# OPENCODE_CLEAR_SANDBOX_KEY, and likewise never captured by the chat_* snapshot.
+CLINE_CLEAR_SANDBOX_KEY = "_cline_clear_sandboxchat"
+
+# Session-state key of Cline's per-session free-model catalog cache (see
+# :func:`_cline_cached_models`). Lives outside the chat panel's snapshot
+# prefixes on purpose: it's a cache, not a user choice.
+_CLINE_MODELS_CACHE_KEY = "_cline_models_cache"
+
+
+def _cline_cached_models(endpoint=llm.CLINE_API_ENDPOINT):
+    """Return Cline's free-model catalog, fetched once per session.
+
+    ``GET {api}/models`` is a remote HTTPS call, so the result is cached in
+    session_state — mirroring the OpenRouter and OpenCode discovery caches —
+    and refreshed on demand via the Refresh button in the Cline controls; a
+    fresh browser session re-fetches automatically. [] means the fetch failed
+    (offline, endpoint down) and the dropdown degrades to the "(default)"
+    option + remembered history until a Refresh succeeds.
+    """
+    cache = st.session_state.get(_CLINE_MODELS_CACHE_KEY)
+    if cache is None:
+        cache = llm.list_cline_models(endpoint)
+        st.session_state[_CLINE_MODELS_CACHE_KEY] = cache
+    return list(cache)
+
+
+def _current_cline_thinking(prefix=""):
+    """Return the resolved cline ``--thinking`` level, or None to omit it.
+
+    ``prefix`` selects which set of widget keys to read. "(provider default)"
+    (the dropdown default) resolves to None — the flag is omitted and Cline's
+    provider default applies; any concrete level passes through unchanged.
+    """
+    sel = st.session_state.get(f"{prefix}llm_cline_thinking_sel")
+    if sel and sel != "(provider default)":
+        return sel
+    return None
+
+
+def _remember_cline_model(model):
+    """Persist ``model`` as the most recently used cline model on disk."""
+    model = (model or "").strip()
+    if not model:
+        return
+    settings = get_core().load_settings()
+    llm_s = dict(settings.get("llm") or {})
+    existing = [m for m in (llm_s.get("llm_cline_models") or []) if m != model]
+    llm_s["llm_cline_models"] = [model] + existing
+    llm_s["llm_cline_last_model"] = model
+    settings["llm"] = llm_s
+    get_core().save_settings(settings)
+
+
+def _render_cline_controls(prefix, saved_llm):
+    """Render the Cline provider's model / thinking / sandbox controls.
+
+    The model dropdown merges the remembered history with an explicit
+    "(default — configured via cline auth)" option; typing a custom model id
+    is the "(other — type below)" escape hatch. The thinking dropdown is the
+    CLI's own closed ``--thinking`` level set. By default the agent runs in a
+    hardened per-chat sandbox (:mod:`md_llm.sandbox`) — the SAME per-session
+    directory the OpenCode provider uses, so switching providers mid-session
+    keeps the sandbox contents.
+    """
+    p = prefix
+
+    history = [
+        m for m in (saved_llm.get("llm_cline_models") or [])
+        if isinstance(m, str) and m
+    ]
+    last_model = saved_llm.get("llm_cline_last_model", "")
+
+    # Merge history (most-recent-first) + the discovered free catalog,
+    # de-duplicated — order-preserving like the OpenRouter dropdown.
+    discovered = _cline_cached_models()
+    merged: list[str] = []
+    for m in [last_model] + history + discovered:
+        if m and m not in merged:
+            merged.append(m)
+
+    options = [CLINE_DEFAULT_MODEL_LABEL] + merged + ["(other — type below)"]
+    sel = st.session_state.get(f"{p}llm_cline_model_sel")
+    if not sel and last_model and last_model in options:
+        st.session_state[f"{p}llm_cline_model_sel"] = last_model
+    if sel and sel not in options:
+        options = [sel] + options
+
+    mcol, rcol = st.columns([4, 1])
+    mcol.selectbox(
+        "Model (default = cline's configured model)",
+        options,
+        key=f"{p}llm_cline_model_sel",
+        help=(
+            "Free models from Cline's public catalog (fetched once per "
+            "session; Refresh re-fetches), plus models you have already used "
+            "here. Keep \"(default)\" to use whatever `cline auth` configured, "
+            "or type a custom id. Note: cline persists the model it is handed "
+            "as its own new default, so runs outside this app will pick it "
+            "up too."
+        ),
+    )
+    if rcol.button("Refresh", key=f"_cline_refresh{p.rstrip('_')}"):
+        st.session_state.pop(_CLINE_MODELS_CACHE_KEY, None)
+        st.rerun()
+    if st.session_state.get(f"{p}llm_cline_model_sel") == "(other — type below)":
+        st.text_input(
+            "Custom model id",
+            value=saved_llm.get(f"{p}llm_cline_model", ""),
+            key=f"{p}llm_cline_model",
+        )
+
+    st.selectbox(
+        "Thinking level",
+        ["(provider default)"] + list(llm.CLINE_THINKING_LEVELS),
+        key=f"{p}llm_cline_thinking_sel",
+        help=(
+            "Reasoning effort passed to `cline --thinking`. \"(provider "
+            "default)\" omits the flag and leaves the provider's own default."
+        ),
+    )
+
+    st.checkbox(
+        "Hardened sandbox (Seatbelt)",
+        value=saved_llm.get(f"{p}llm_cline_hardened", True),
+        key=f"{p}llm_cline_hardened",
+        help=(
+            "Run the agent under a macOS Seatbelt profile: writes are confined "
+            "to the working directory plus scratch space, and reads of this "
+            "app's data folder (uploads, chats, settings) and of credential "
+            "stores (~/.ssh, ~/.gnupg, ...) are blocked. Network stays open "
+            "for the model API."
+        ),
+    )
+    st.text_input(
+        "Working directory (optional override)",
+        value=saved_llm.get(f"{p}llm_cline_workdir", ""),
+        key=f"{p}llm_cline_workdir",
+        placeholder="fresh per-chat sandbox (recommended)",
+        help=(
+            "Leave empty to give each chat session its own fresh sandbox "
+            "directory — cleared before use, garbage-collected after. Enter a "
+            "path to pin a real project directory instead; it is never wiped "
+            "automatically. Shared with the OpenCode provider's sandbox."
+        ),
+    )
+    if st.button("Clear this chat's sandbox", key=f"_cline_clear_sandbox{p.rstrip('_')}"):
+        doc = docs.active_document()
+        sb_key = docs.chat_key("_opencode_sandbox", docs.active_chat(doc), doc)
+        path = st.session_state.pop(sb_key, None)
+        if path and sandbox.clear_sandbox(path):
+            st.toast("Sandbox directory deleted.", icon="🧹")
+        else:
+            st.caption("No active sandbox yet — it is created on first send.")
+    st.caption(
+        "_Cline runs headless with all tools auto-approved (`--auto-approve "
+        "true`). Authenticate models out-of-band via `cline auth` or provider "
+        "env vars._"
+    )
+
+
 # --- control widgets --------------------------------------------------------
 
 def _on_oai_endpoint_change(prefix):
@@ -783,7 +973,7 @@ def _render_llm_controls(prefix="", show_instruction=True):
     saved_llm = get_core().load_settings().get("llm") or {}
     provider = st.radio(
         "Provider",
-        ["OpenCode", "OpenRouter", "Ollama", "OpenAI-compatible"],
+        ["OpenCode", "Cline", "OpenRouter", "Ollama", "OpenAI-compatible"],
         horizontal=True,
         key=f"{p}llm_provider",
     )
@@ -808,6 +998,8 @@ def _render_llm_controls(prefix="", show_instruction=True):
         _render_oai_controls(prefix, saved_llm)
     elif provider == "OpenCode":
         _render_opencode_controls(prefix, saved_llm)
+    elif provider == "Cline":
+        _render_cline_controls(prefix, saved_llm)
     else:
         st.text_input(
             "OpenRouter endpoint",

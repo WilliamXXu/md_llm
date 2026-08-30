@@ -462,5 +462,149 @@ class OpencodeVariantOptionsTests(unittest.TestCase):
         self.assertIn("xhigh", options)
 
 
+class ClineCachedModelsTests(unittest.TestCase):
+    """_cline_cached_models fetches once per session, then serves the cache."""
+
+    def setUp(self):
+        st.session_state.pop(controls._CLINE_MODELS_CACHE_KEY, None)
+
+    def tearDown(self):
+        st.session_state.pop(controls._CLINE_MODELS_CACHE_KEY, None)
+
+    def test_fetches_once_then_serves_cache(self):
+        with mock.patch.object(
+            llm, "list_cline_models", return_value=["a/b:free"]
+        ) as fetch:
+            first = controls._cline_cached_models()
+            second = controls._cline_cached_models()
+        self.assertEqual(first, ["a/b:free"])
+        self.assertEqual(second, ["a/b:free"])
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_refresh_key_pop_forces_refetch(self):
+        with mock.patch.object(
+            llm, "list_cline_models", return_value=["a/b:free"]
+        ) as fetch:
+            controls._cline_cached_models()
+            st.session_state.pop(controls._CLINE_MODELS_CACHE_KEY, None)
+            self.assertEqual(controls._cline_cached_models(), ["a/b:free"])
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_failed_fetch_is_cached_until_refresh(self):
+        with mock.patch.object(
+            llm, "list_cline_models", return_value=[]
+        ) as fetch:
+            self.assertEqual(controls._cline_cached_models(), [])
+            self.assertEqual(controls._cline_cached_models(), [])
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_forwarded_endpoint(self):
+        with mock.patch.object(llm, "list_cline_models") as fetch:
+            controls._cline_cached_models("https://proxy.example/v1")
+        fetch.assert_called_once_with("https://proxy.example/v1")
+
+
+class CurrentClineThinkingTests(unittest.TestCase):
+    """_current_cline_thinking resolves the --thinking dropdown (None = omit)."""
+
+    def setUp(self):
+        for k in ("llm_cline_thinking_sel", "chat_llm_cline_thinking_sel"):
+            st.session_state.pop(k, None)
+
+    def tearDown(self):
+        self.setUp()
+
+    def test_none_when_unset(self):
+        self.assertIsNone(controls._current_cline_thinking())
+
+    def test_none_for_provider_default_option(self):
+        st.session_state["llm_cline_thinking_sel"] = "(provider default)"
+        self.assertIsNone(controls._current_cline_thinking())
+
+    def test_returns_preset_selection(self):
+        st.session_state["llm_cline_thinking_sel"] = "high"
+        self.assertEqual(controls._current_cline_thinking(), "high")
+
+    def test_respects_prefix(self):
+        st.session_state["chat_llm_cline_thinking_sel"] = "xhigh"
+        self.assertIsNone(controls._current_cline_thinking())
+        self.assertEqual(controls._current_cline_thinking("chat_"), "xhigh")
+
+
+class CurrentLlmModelClineTests(unittest.TestCase):
+    """_current_llm_model's Cline branch (dropdown / custom / default)."""
+
+    def setUp(self):
+        st.session_state["llm_provider"] = "Cline"
+        st.session_state["chat_llm_provider"] = "Cline"
+        for k in ("llm_cline_model_sel", "llm_cline_model",
+                  "chat_llm_cline_model_sel", "chat_llm_cline_model"):
+            st.session_state.pop(k, None)
+
+    def tearDown(self):
+        st.session_state.pop("llm_provider", None)
+        st.session_state.pop("chat_llm_provider", None)
+        self.setUp()
+
+    def test_dropdown_selection_wins(self):
+        st.session_state["llm_cline_model_sel"] = "z-ai/glm-5.3-flash"
+        self.assertEqual(
+            controls._current_llm_model(), "z-ai/glm-5.3-flash"
+        )
+
+    def test_custom_input_wins_when_other_selected(self):
+        st.session_state["llm_cline_model_sel"] = "(other — type below)"
+        st.session_state["llm_cline_model"] = "  prov/m  "
+        self.assertEqual(controls._current_llm_model(), "prov/m")
+
+    def test_default_option_resolves_to_empty(self):
+        """The "(default)" option omits --model — cline's own model applies."""
+        st.session_state["llm_cline_model_sel"] = controls.CLINE_DEFAULT_MODEL_LABEL
+        self.assertEqual(controls._current_llm_model(), "")
+
+    def test_unset_resolves_to_empty(self):
+        self.assertEqual(controls._current_llm_model(), "")
+
+    def test_respects_prefix(self):
+        st.session_state["chat_llm_cline_model_sel"] = "prov/chat"
+        self.assertEqual(controls._current_llm_model(), "")
+        self.assertEqual(controls._current_llm_model("chat_"), "prov/chat")
+
+
+class RememberClineModelTests(unittest.TestCase):
+    """_remember_cline_model promotes the model in the on-disk history."""
+
+    def setUp(self):
+        core._reset_for_tests(_make_core())
+
+    def tearDown(self):
+        core._reset_for_tests(None)
+
+    def _saved(self):
+        return core.get_core().load_settings().get("llm") or {}
+
+    def test_promotes_to_front_and_sets_last_model(self):
+        controls._remember_cline_model("prov/first")
+        controls._remember_cline_model("prov/second")
+        saved = self._saved()
+        self.assertEqual(
+            saved["llm_cline_models"], ["prov/second", "prov/first"]
+        )
+        self.assertEqual(saved["llm_cline_last_model"], "prov/second")
+
+    def test_dedupes_re_selection(self):
+        controls._remember_cline_model("prov/m")
+        controls._remember_cline_model("prov/other")
+        controls._remember_cline_model("prov/m")
+        saved = self._saved()
+        self.assertEqual(saved["llm_cline_models"], ["prov/m", "prov/other"])
+        self.assertEqual(saved["llm_cline_last_model"], "prov/m")
+
+    def test_ignores_empty(self):
+        controls._remember_cline_model("")
+        controls._remember_cline_model("   ")
+        self.assertEqual(self._saved().get("llm_cline_models", []), [])
+
+
 if __name__ == "__main__":
     unittest.main()

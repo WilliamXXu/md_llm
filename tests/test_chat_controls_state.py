@@ -73,6 +73,17 @@ class ChatControlKeysTests(unittest.TestCase):
         keys = set(chat._chat_control_keys())
         self.assertNotIn(controls.OPENCODE_CLEAR_SANDBOX_KEY, keys)
 
+    def test_cline_clear_sandbox_button_key_matches_snapshot_contract(self):
+        # The Cline clear-sandbox button builds its key from the same
+        # per-panel pattern; it must obey the same no-button-key-in-snapshot
+        # rule as the OpenCode one (see the regression note above) — even
+        # while the key is live in session_state.
+        from md_llm import controls
+        self.assertEqual(controls.CLINE_CLEAR_SANDBOX_KEY, "_cline_clear_sandboxchat")
+        st.session_state[controls.CLINE_CLEAR_SANDBOX_KEY] = False
+        keys = set(chat._chat_control_keys())
+        self.assertNotIn(controls.CLINE_CLEAR_SANDBOX_KEY, keys)
+
 
 class SnapshotChatControlsTests(unittest.TestCase):
     def setUp(self):

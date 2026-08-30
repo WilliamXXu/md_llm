@@ -3,7 +3,7 @@
 A reusable Streamlit component package: a **markdown reader** + **LLM chat**
 panel for any markdown/text files. Plugs into any Streamlit host app.
 
-Four LLM providers (stdlib-only clients, no SDK):
+Five LLM providers (stdlib-only clients, no SDK):
 
 - **Ollama** — local server (optional `autossh` tunnel to a remote box).
 - **OpenRouter** — hosted API keyed by `OPENROUTER_API_KEY`. The Model
@@ -20,6 +20,16 @@ Four LLM providers (stdlib-only clients, no SDK):
   (`--variant`, the provider's reasoning effort). Models — and each model's
   available variants — are discovered automatically via
   `opencode models --verbose`; the highest-effort variant is preselected.
+- **Cline** — the Cline coding **agent** CLI, invoked via `cline --json`
+  (subprocess, headless act mode with tools auto-approved). Auth/model routing
+  are Cline's own (`cline auth`); the panel exposes a working directory and a
+  reasoning-effort level (`--thinking`). The Model dropdown auto-populates
+  with Cline's zero-cost catalog (public `GET api.cline.bot/api/v1/models`,
+  fetched once per session; **Refresh** re-fetches) on top of remembered
+  history, with a "(default)" option that uses Cline's own configured model
+  (note: a model handed to cline persists as its new default). Both agent
+  providers run in the same per-chat-session sandbox — a fresh directory per
+  session, Seatbelt-confined on macOS when **Hardened sandbox** is on.
 
 ## Install
 
@@ -167,7 +177,7 @@ before saving, with the host's `chat_save_dir` as the fallback default).
 src/md_llm/
 ├── __init__.py   # public API: Core, init, render_reader, render_toc, render_chat, open_in_reader, render_doc_selector, render_doc_buttons, open_documents, add_document, remove_document, TABS_KEY, *_TAB_LABEL
 ├── core.py       # Core dataclass + init/get_core (dependency-injected host config)
-├── llm.py        # stdlib-only LLM clients (Ollama / OpenRouter / OpenAI-compatible / OpenCode)
+├── llm.py        # stdlib-only LLM clients (Ollama / OpenRouter / OpenAI-compatible / OpenCode / Cline)
 ├── state.py      # generic helpers: _read_text, _human_size, _display_name_for_filepath
 ├── console.py    # log_event + set_logger hook (forwards to host console)
 ├── controls.py   # provider/model/endpoint widgets + per-endpoint OAI registry

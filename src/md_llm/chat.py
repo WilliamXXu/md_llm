@@ -30,9 +30,12 @@ conversation** button writes it as a plain ``<docstem>__chat_<UTC>.md`` file
 into the **Save location** directory — a memorized choice (settings key
 ``llm.chat_save_dir``, editable in the expander under the save buttons) that
 falls back to the host's ``core.chat_save_dir``. No sidecar metadata, no
-transcript linkage — md_llm has no notion of "transcripts". The
-provider/model/key controls live in this panel under the ``chat_`` key
-namespace.
+transcript linkage — md_llm has no notion of "transcripts". A **Resend
+request** button re-runs the conversation's latest user turn through the same
+send pipeline — handy after a failed call or after switching provider/model;
+a trailing assistant reply is replaced by the new one (and restored if the
+resend can't start). The provider/model/key controls live in this panel under
+the ``chat_`` key namespace.
 """
 
 from __future__ import annotations
@@ -51,10 +54,12 @@ from . import sandbox
 from .autossh import _render_autossh_panel
 from .console import log_event
 from .controls import (
+    _current_cline_thinking,
     _current_llm_model,
     _current_oai_endpoint,
     _current_opencode_variant,
     _oai_registry_entry,
+    _remember_cline_model,
     _remember_oai_endpoint,
     _remember_opencode_model,
     _remember_openrouter_endpoint,
@@ -85,6 +90,13 @@ _CHAT_BG_TASK = "_chat_bg_task"
 # chat↔reader decoupled. Popped and sent by _send_staged_quick_prompt.
 _READER_QUICK_PROMPT = "_reader_quick_prompt"
 
+# Widget key of the Resend-request button. Starts with neither ``chat_`` nor
+# ``_chat_ssh_`` so the control snapshot (``_chat_control_keys``) never
+# captures it: a button key must never be re-injected into session_state via
+# ``_restore_chat_controls`` (Streamlit refuses session-state writes to button
+# keys — the same rule as the OpenCode clear-sandbox button's key).
+_RESEND_BUTTON_KEY = "_chat_resend_request"
+
 
 def _chat_state_key(base):
     """Session-state key for one chat field, scoped to the active session.
@@ -105,13 +117,15 @@ def _staged_quick_prompt_key():
 
 
 def _session_sandbox_dir():
-    """This chat session's OpenCode sandbox, created empty on first use.
+    """This chat session's agent sandbox, created empty on first use.
 
     Memoized per chat session via ``docs.chat_key``, so every turn of one
     session reuses the same directory (files persist across its turns) while
     every other session — even on the same document, running in parallel —
-    gets a distinct one. Directories abandoned by closed sessions/app restarts
-    are garbage-collected by age when a new sandbox is created; see
+    gets a distinct one. Both agent providers (OpenCode and Cline) share the
+    session's directory, so switching providers keeps its contents.
+    Directories abandoned by closed sessions/app restarts are
+    garbage-collected by age when a new sandbox is created; see
     :mod:`md_llm.sandbox` for the isolation and clearing guarantees.
     """
     doc = docs.active_document()
@@ -423,12 +437,12 @@ def _send_context_and_turns(context_path):
 
 
 def _turns_to_opencode_prompt(turns):
-    """Flatten the chat message list into a single prompt for ``opencode run``.
+    """Flatten the chat message list into a single prompt for an agent run.
 
-    ``opencode run`` takes one positional prompt (not a message array), so the
-    document-context turn + the Q&A history are rendered as labelled
-    ``User:`` / ``Assistant:`` blocks. The system instruction is passed
-    separately to :func:`md_llm.llm.opencode_chat_stream`, which prepends it.
+    The agent CLIs (``opencode run`` and ``cline``) take one positional prompt
+    (not a message array), so the document-context turn + the Q&A history are
+    rendered as labelled ``User:`` / ``Assistant:`` blocks. The system
+    instruction is passed separately to the stream client, which prepends it.
     """
     labels = {"user": "User", "assistant": "Assistant", "system": "System"}
     parts = []
@@ -466,7 +480,10 @@ def _build_stream(context_path, holder):
     model = _current_llm_model(prefix=p)
     instruction = st.session_state.get(f"{p}llm_instruction") or None
 
-    if not model:
+    # Cline may legitimately run with no model: an empty selection means "use
+    # whatever `cline auth` configured", so the blanket model check below is
+    # skipped for it.
+    if not model and provider != "Cline":
         return None, "Pick or type an LLM model first (in the LLM controls)."
 
     turns = _send_context_and_turns(context_path)
@@ -543,6 +560,26 @@ def _build_stream(context_path, holder):
             agent=agent, variant=variant, hardened=hardened,
             instruction=instruction,
         )
+    elif provider == "Cline":
+        workdir = sandbox.normalize_workdir(
+            st.session_state.get(f"{p}llm_cline_workdir")
+        )
+        hardened = bool(st.session_state.get(f"{p}llm_cline_hardened", True))
+        if workdir is None:
+            # Managed mode: this session's own fresh sandbox (Seatbelt-confined
+            # when hardened), never the shared uploads folder. Shared with the
+            # OpenCode provider, so switching agents keeps the session files.
+            workdir = _session_sandbox_dir()
+        thinking = _current_cline_thinking(p)
+        # Persist the chosen model so it reappears next session (the "(default)"
+        # option resolves to "" and is not remembered).
+        if model:
+            _remember_cline_model(model)
+        prompt = _turns_to_opencode_prompt(turns)
+        gen = llm.cline_chat_stream(
+            prompt, model=model or None, workdir=workdir, thinking=thinking,
+            hardened=hardened, instruction=instruction,
+        )
     else:
         endpoint = st.session_state.get(
             f"{p}llm_endpoint", llm.DEFAULT_ENDPOINT
@@ -589,6 +626,82 @@ def _send_staged_quick_prompt(context_path):
     stream, verr = _build_stream(context_path, holder)
     if stream is None:
         msgs.pop()  # validation failed: roll back the dangling question
+        st.session_state[_chat_state_key("_chat_last_error")] = verr
+        log_event(f"Chat failed: {verr}", level="error", source=chat_src)
+        return None
+    task = {"text": "", "done": False, "error": None, "source": chat_src}
+    worker = threading.Thread(
+        target=_stream_worker, args=(task, stream, holder), daemon=True,
+    )
+    st.session_state[_chat_state_key(_CHAT_BG_TASK)] = task
+    worker.start()
+    return task
+
+
+def _has_last_request():
+    """True when the active conversation holds at least one user request.
+
+    Gates the Resend-request button: with no user turn there is nothing to
+    resend (the leading document-context turn is rebuilt at send time and is
+    never stored in ``_chat_messages``).
+    """
+    return any(
+        m.get("role") == "user"
+        for m in (st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or [])
+    )
+
+
+def _resend_last_request(context_path):
+    """Re-run the conversation's latest request through the send pipeline.
+
+    Resends the most recent user turn — handy after a failed call (the error
+    bubble leaves the request in the history with no reply) or after switching
+    provider/model in the LLM controls (the resend picks up the CURRENT
+    controls, exactly like a typed send). A trailing assistant reply — a
+    previous answer, or the empty-response placeholder a failed stream left
+    behind — is dropped first, so the new reply REPLACES the old outcome
+    instead of duplicating the Q/A pair; if the resend fails validation the
+    dropped reply is put back, so an aborted retry never loses the previous
+    answer.
+
+    Runs the exact ``st.chat_input`` pipeline minus the append:
+    ``_build_stream`` snapshots the (trimmed) conversation and the stream is
+    handed to a background worker thread. Returns the started task dict, or
+    None when there is no user turn to resend or validation failed (the error
+    lands in ``_chat_last_error`` and surfaces as the transient error bubble,
+    exactly like a failed typed send). Must be called AFTER the chat controls
+    have mounted this run, like the typed/staged sends it mirrors.
+    """
+    msgs_key = _chat_state_key(_CHAT_MESSAGES)
+    # The stored list (not a copy): the trim below must edit the live
+    # conversation so the stream snapshot and the history agree.
+    msgs = st.session_state.get(msgs_key) or []
+    last_user = next(
+        (i for i in range(len(msgs) - 1, -1, -1)
+         if msgs[i].get("role") == "user"),
+        None,
+    )
+    prompt = (msgs[last_user].get("content") or "").strip() \
+        if last_user is not None else ""
+    if not prompt:
+        st.warning("Nothing to resend — this conversation has no request yet.")
+        return None
+
+    provider = st.session_state.get("chat_llm_provider", "OpenRouter")
+    model = _current_llm_model(prefix="chat_") or "(unknown)"
+    chat_src = f"LLM chat ({provider} · {model})"
+    preview = prompt.replace("\n", " ")[:80]
+    log_event(f"Chat resend → {preview}", level="info", source=chat_src)
+
+    # Drop the trailing assistant outcome so the resent request replaces it
+    # rather than appending a duplicate Q/A pair.
+    dropped = msgs[last_user + 1:]
+    del msgs[last_user + 1:]
+
+    holder = {}
+    stream, verr = _build_stream(context_path, holder)
+    if stream is None:
+        msgs.extend(dropped)  # aborted retry must not lose the old reply
         st.session_state[_chat_state_key("_chat_last_error")] = verr
         log_event(f"Chat failed: {verr}", level="error", source=chat_src)
         return None
@@ -1217,7 +1330,7 @@ def render_chat():
             st.session_state.pop(_staged_quick_prompt_key(), None)
             st.rerun()
 
-    col_save, col_clear, _ = st.columns([1, 1, 2])
+    col_save, col_clear, col_resend, _ = st.columns([1, 1, 1, 1])
     if col_save.button("Save conversation"):
         provider = st.session_state.get("chat_llm_provider", "OpenRouter")
         model = _current_llm_model(prefix="chat_") or "(none)"
@@ -1232,6 +1345,24 @@ def render_chat():
         st.session_state.pop(_chat_state_key(_CHAT_MESSAGES), None)
         st.session_state.pop(_chat_state_key(_CHAT_BG_TASK), None)
         st.rerun()
+    # Resend runs the latest request back through the send pipeline. No
+    # st.rerun() here either: adopting the started task into ``_task`` lets
+    # this same run continue into the streaming-bubble block below (the same
+    # in-render handoff the staged ⚡ prompt uses).
+    if col_resend.button(
+        "Resend request",
+        key=_RESEND_BUTTON_KEY,
+        disabled=bool(_task) or not _has_last_request(),
+        help=(
+            "Send the conversation's latest request to the LLM again — e.g. "
+            "after a failed call or after switching provider/model. A "
+            "trailing assistant reply is replaced by the new one (and is "
+            "restored if the resend can't start)."
+        ),
+    ):
+        _started = _resend_last_request(context_path)
+        if _started:
+            _task = _started
 
     # --- Save location (memorized; default = the host's chat_save_dir) ---
     # Rendered every run, even collapsed: the on_change callback persists each

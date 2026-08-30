@@ -1,6 +1,6 @@
 """Lightweight LLM clients for post-processing transcripts (summarize, etc.).
 
-Four providers are supported:
+Five providers are supported:
   - Ollama: a local server reachable over HTTP (default).
   - OpenRouter: a hosted API keyed by OPENROUTER_API_KEY.
   - OpenAI: a generic OpenAI-compatible API keyed by OPENAI_API_KEY. Point
@@ -11,6 +11,10 @@ Four providers are supported:
     (`opencode run --format json --auto`). Not a plain chat API — with --auto it
     can run tools (bash/read/edit/...) in a working directory. Auth + model
     routing are OpenCode's own; the chat panel streams its JSONL event output.
+  - Cline: the Cline coding AGENT CLI, also invoked as a subprocess
+    (`cline --json "prompt"`). Like OpenCode it runs tools (auto-approved) in a
+    working directory; auth + model routing are Cline's own (`cline auth`), and
+    the chat panel streams its NDJSON event output.
 
 Uses only the standard library (urllib + json + subprocess) to match the
 no-extra-deps style of transcribe_local.py's remote-Whisper client.
@@ -18,6 +22,7 @@ no-extra-deps style of transcribe_local.py's remote-Whisper client.
 
 import os
 import json
+import re
 import subprocess
 import threading
 import urllib.error
@@ -78,6 +83,53 @@ OPENCODE_EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "m
 # valid `--variant` value, least → most effort. The UI also lets the user type
 # a custom one.
 OPENCODE_VARIANTS = [v for v in OPENCODE_EFFORT_ORDER if v != "none"]
+
+# Cline (the Cline coding agent CLI) defaults. Like OpenCode it is an agent
+# invoked as a subprocess (`cline --json "prompt"`, tools auto-approved in the
+# working directory), not an LLM API. Auth + model routing are Cline's own
+# (configure via `cline auth`); passing no --model uses the model Cline was
+# configured with. Model ids are free-form (e.g. "z-ai/glm-5.3-flash"); the
+# CLI itself has no non-interactive model listing, but Cline's provider API
+# exposes a public OpenAI-style catalog at {base}/models (no auth) whose ids
+# carry a ":free" suffix on the zero-cost models — the same convention as
+# OpenRouter's catalog, so the UI fetches the free ids for its dropdown.
+CLINE_BIN = "cline"
+CLINE_API_ENDPOINT = "https://api.cline.bot/api/v1"
+
+# The reasoning-effort levels `cline --thinking` accepts, least → most effort.
+# A closed set advertised by the CLI itself, so no discovery subprocess is
+# needed; omitting the flag leaves the provider's own default.
+CLINE_THINKING_LEVELS = ["none", "low", "medium", "high", "xhigh"]
+
+# ANSI colour escapes cline's own CLI errors carry (stripped before the raw
+# stderr tail is surfaced to the user).
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def list_cline_models(endpoint=CLINE_API_ENDPOINT, timeout=30):
+    """Return Cline's free model ids from its public provider-API catalog.
+
+    ``GET {endpoint}/models`` is public (no auth) and lists every model
+    routable through Cline's own provider; only the ``:free``-suffixed ids are
+    returned — the catalog's zero-cost models, sorted — matching the
+    convention of :func:`list_openrouter_models`. Returns an empty list on any
+    connection / HTTP / parse error so callers (e.g. a UI selectbox) can
+    degrade gracefully to manual entry.
+    """
+    url = _join_url(endpoint, "/models")
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+        return []
+
+    models = []
+    for entry in payload.get("data") or []:
+        model_id = entry.get("id") if isinstance(entry, dict) else None
+        if isinstance(model_id, str) and model_id.endswith(":free"):
+            models.append(model_id)
+    return sorted(models)
 
 
 def _join_url(endpoint, path):
@@ -1165,3 +1217,247 @@ def opencode_chat_stream(
         raise RuntimeError(
             f"opencode run exited {proc.returncode}: {stderr_text[-500:]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Cline (coding agent, subprocess path)
+# ---------------------------------------------------------------------------
+#
+# `cline --json "prompt"` emits newline-delimited JSON (NDJSON) on stdout, one
+# object per line, with a top-level ``type`` field:
+#   - "agent_event" → event.type further qualifies it:
+#       * "content_start" (contentType "text") → event.text is a streaming
+#         delta of the assistant's reply (yield it)
+#       * "content_end"   (contentType "text") → event.text is the finished
+#         text of the whole block; only the part not already streamed is
+#         yielded (deltas usually covered it entirely)
+#       * "content_end"   (contentType "tool") → a tool finished
+#         (event.toolName, event.output); surfaced inline as a one-line marker
+#         so the user sees agent activity
+#       * iteration / usage / reasoning events → ignored here
+#   - "run_result"   → the final summary; its ``finishReason`` ("completed" /
+#     "error") and ``text`` decide success.
+# Failures are reported as ``{"type":"error","message":...}`` NDJSON lines on
+# STDERR (plus finishReason "error" and a non-zero exit); the last such message
+# is the real failure. Reasoning (``contentType: "reasoning"``) is not yielded.
+# As with OpenCode, token-level streaming comes from the content deltas, and
+# text still lands per content block across agent steps.
+
+
+def _cline_tool_label(output):
+    """One-line label for a cline tool event's output payload ('' when none).
+
+    Tool outputs are either a single object (``{"query": "edit:/path/…",
+    "result": …, "success": …}``) or a list of such objects (read_files et al.);
+    the first ``query`` found names what the tool acted on. ``result`` only
+    serves as the fallback when NO item carries a query, and anything else
+    (missing / non-dict shapes) yields ''.
+    """
+    if isinstance(output, dict):
+        output = [output]
+    if isinstance(output, list):
+        fallback = ""
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            query = item.get("query")
+            if query:
+                return " ".join(str(query).split())
+            if not fallback:
+                fallback = str(item.get("result") or "")
+        return " ".join(fallback.split())
+    return ""
+
+
+def cline_chat_stream(
+    prompt,
+    *,
+    model=None,
+    workdir=None,
+    thinking=None,
+    binary=CLINE_BIN,
+    instruction=None,
+    hardened=False,
+    timeout=REQUEST_TIMEOUT,
+):
+    """Run ``cline --json`` and stream assistant text.
+
+    Cline is a coding AGENT, not a plain chat API: a positional prompt runs it
+    headless in act mode with tools auto-approved (``--auto-approve true``), so
+    it may run bash/read/edit/etc. in ``workdir`` (``--cwd``). The NDJSON event
+    stream is parsed line by line; text deltas are yielded as assistant chunks,
+    finished tools are surfaced inline as a one-line marker, and a ``run_result``
+    with ``finishReason: "error"`` (or a non-zero exit) raises
+    :class:`RuntimeError` — preferring the last ``{"type":"error"}`` message
+    cline wrote to stderr. If ``instruction`` is given it is prepended to the
+    prompt; if ``model`` is given it is forwarded as ``--model`` (omit it to use
+    the model Cline was configured with via ``cline auth``); if ``thinking`` is
+    given it is forwarded as ``--thinking`` (none|low|medium|high|xhigh).
+
+    Two CLI quirks are handled here (observed on cline 3.0.60): a
+    whitespace-free prompt argument is parsed as a command lookup (``cline hi``
+    → "Unknown command or unquoted prompt"), so a trailing newline is appended
+    when the prompt carries no whitespace at all; and passing ``--model``
+    persists that model as Cline's own new default, so later runs outside this
+    app will use it too.
+
+    With ``hardened=True`` (macOS) the subprocess runs under a generated
+    Seatbelt profile (:mod:`md_llm.sandbox`): file writes are confined to the
+    workdir + scratch space, reads of the host's data tree and credential
+    stores are denied, network stays open for the model API.
+
+    Auth + model routing are Cline's own (configure via ``cline auth`` / env).
+    Very large prompts may hit the OS argv length limit (cline 3.0.60's piped
+    stdin mode is broken, so the argument-passing route is the only one).
+
+    Raises :class:`RuntimeError` with a clear message on a missing binary /
+    server / agent failure so the UI can surface it via ``st.error``.
+    """
+    if not prompt:
+        raise ValueError("No prompt for cline run.")
+
+    full_prompt = prompt
+    if instruction:
+        full_prompt = f"{instruction}\n\n{prompt}"
+    # See docstring: cline parses a whitespace-free positional as a command.
+    if not re.search(r"\s", full_prompt):
+        full_prompt += "\n"
+
+    args = [binary, "--json", "--auto-approve", "true"]
+    if model:
+        args += ["--model", model]
+    if thinking:
+        args += ["--thinking", thinking]
+    if workdir:
+        args += ["--cwd", workdir]
+    args.append(full_prompt)
+
+    # cline's --cwd chdirs, so the directory must already exist. Create it
+    # (best-effort) — this also gives a fresh sandbox a place to land.
+    if workdir:
+        try:
+            os.makedirs(workdir, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(
+                f"Could not create cline working directory {workdir!r}: {e}"
+            ) from e
+
+    # Wrap in a macOS Seatbelt profile when hardened mode is requested and the
+    # host can enforce it; elsewhere (or without sandbox-exec) run unconfined.
+    profile_path = None
+    if hardened and sandbox.seatbelt_available():
+        try:
+            profile_path = sandbox.write_seatbelt_profile(workdir or ".")
+            args = ["sandbox-exec", "-f", profile_path] + args
+        except OSError:
+            profile_path = None  # degrade to unconfined rather than fail
+
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # line-buffered so yielded lines arrive as produced
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"Could not find the {binary!r} executable on PATH. Install "
+            "cline (see https://docs.cline.bot) to use this provider."
+        ) from e
+    except OSError as e:
+        raise RuntimeError(f"Could not start cline: {e}") from e
+
+    # Drain stderr on a background thread so a chatty agent can't fill the OS
+    # pipe buffer (64 KiB) and deadlock the stdout reader.
+    stderr_lines: list[str] = []
+
+    def _drain_stderr():
+        if proc.stderr is not None:
+            for ln in proc.stderr:
+                stderr_lines.append(ln)
+
+    drainer = threading.Thread(target=_drain_stderr, daemon=True)
+    drainer.start()
+
+    finish_reason = None  # run_result.finishReason ("completed"/"error"/…)
+    finish_text = ""      # run_result.text (the error message on failures)
+    streamed = ""         # text already yielded for the current text block
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(evt, dict):
+                continue
+            if evt.get("type") != "agent_event":
+                if evt.get("type") == "run_result":
+                    finish_reason = evt.get("finishReason")
+                    finish_text = evt.get("text") or ""
+                continue
+            event = evt.get("event") or {}
+            etype = event.get("type")
+            if etype == "iteration_start":
+                # Content blocks complete within their iteration; dropping any
+                # un-ended block's delta prefix here keeps the dedup check in
+                # content_end honest for the next block.
+                streamed = ""
+            elif etype == "content_start" and event.get("contentType") == "text":
+                piece = event.get("text") or ""
+                if piece:
+                    streamed += piece
+                    yield piece
+            elif etype == "content_end":
+                ctype = event.get("contentType")
+                if ctype == "text":
+                    # Deltas already streamed via content_start; yield only
+                    # whatever the finished text adds beyond that prefix.
+                    full = event.get("text") or ""
+                    if full.startswith(streamed):
+                        rest = full[len(streamed):]
+                        if rest:
+                            yield rest
+                    streamed = ""
+                elif ctype == "tool":
+                    tool = event.get("toolName") or "tool"
+                    label = _cline_tool_label(event.get("output"))
+                    suffix = f" — {label}" if label else ""
+                    yield f"\n\n_🔧 {tool}{suffix}_\n\n"
+        proc.wait(timeout=timeout)
+    finally:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        drainer.join(timeout=5)
+        if profile_path:
+            _unlink_quietly(profile_path)
+
+    if finish_reason == "error" or proc.returncode not in (0, None):
+        # cline writes {"type":"error","message":…} NDJSON lines to stderr; the
+        # LAST one is the real failure (earlier ones can be hook noise). Fall
+        # back to the run_result text, then the raw stderr tail (ANSI-stripped:
+        # CLI parse errors arrive colourized, e.g. "\x1b[31merror:\x1b[0m …").
+        err_msg = None
+        for ln in stderr_lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                s_evt = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(s_evt, dict) and s_evt.get("type") == "error":
+                err_msg = s_evt.get("message") or err_msg
+        if not err_msg:
+            err_msg = (
+                finish_text
+                or _ANSI_ESCAPE_RE.sub("", "".join(stderr_lines)).strip()[-500:]
+                or f"exited {proc.returncode}"
+            )
+        raise RuntimeError(f"cline error: {err_msg}")
