@@ -39,6 +39,11 @@ pip install -e /path/to/md_llm        # dev / editable
 pip install git+ssh://git@github.com/you/md_llm.git
 ```
 
+Cloning alone is **not** enough to get the "Mac app" — the Python
+environment and the macOS Finder droplet (`/Applications/md_llm.app`) are
+local artifacts rebuilt per machine. See [SETUP.md](SETUP.md) for the
+new-machine guide.
+
 ## Host integration contract
 
 A host app must:
