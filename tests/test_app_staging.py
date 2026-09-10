@@ -1,4 +1,4 @@
-"""Tests for the demo's uploader staging (``md_llm.demo._stage_new_uploads``).
+"""Tests for the app's uploader staging (``md_llm.app._stage_new_uploads``).
 
 st.file_uploader returns the same value on every rerun, so staging must tell
 a genuine (re-)pick from a plain widget-value replay. The regression these
@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import streamlit as st
 
-from md_llm import demo, docs
+from md_llm import app, docs
 
 
 class _FakeUpload:
@@ -41,7 +41,6 @@ def _clear_state():
             or k.startswith("_chat_")
             or k.startswith("_reader_")
             or k.startswith("_app_")
-            or k.startswith("_demo_")
         ):
             st.session_state.pop(k, None)
 
@@ -52,7 +51,7 @@ class StageNewUploadsTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self._uploads = Path(self._tmp.name)
-        patcher = patch.object(demo, "_UPLOADS_DIR", self._uploads)
+        patcher = patch.object(app, "_UPLOADS_DIR", self._uploads)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -61,55 +60,55 @@ class StageNewUploadsTests(unittest.TestCase):
 
     def test_fresh_pick_stages_and_opens(self):
         up = _FakeUpload("notes.md", "fid-1")
-        demo._stage_new_uploads([up])
+        app._stage_new_uploads([up])
         self.assertEqual(docs.open_documents(), ["notes.md"])
         self.assertTrue((self._uploads / "notes.md").read_bytes() == b"content")
 
     def test_replay_after_close_does_not_reopen(self):
         """The regression: the rerun a ✕ close triggers must not re-open."""
         up = _FakeUpload("notes.md", "fid-1")
-        demo._stage_new_uploads([up])                      # pick
-        demo._stage_new_uploads([up])                      # plain rerun replay
+        app._stage_new_uploads([up])                      # pick
+        app._stage_new_uploads([up])                      # plain rerun replay
         self.assertEqual(docs.open_documents(), ["notes.md"])
         docs.remove_document("notes.md")                   # the ✕ / Clear close
-        demo._stage_new_uploads([up])                      # the close's rerun
+        app._stage_new_uploads([up])                      # the close's rerun
         self.assertEqual(docs.open_documents(), [])
 
     def test_repick_with_new_file_id_reopens(self):
         up = _FakeUpload("notes.md", "fid-1")
-        demo._stage_new_uploads([up])
+        app._stage_new_uploads([up])
         docs.remove_document("notes.md")
-        demo._stage_new_uploads([_FakeUpload("notes.md", "fid-2")])
+        app._stage_new_uploads([_FakeUpload("notes.md", "fid-2")])
         self.assertEqual(docs.open_documents(), ["notes.md"])
 
     def test_replay_keeps_other_documents(self):
         a = _FakeUpload("a.md", "fid-a")
         b = _FakeUpload("b.md", "fid-b")
-        demo._stage_new_uploads([a, b])
+        app._stage_new_uploads([a, b])
         docs.remove_document("a.md")
-        demo._stage_new_uploads([a, b])                    # replay, a.md closed
+        app._stage_new_uploads([a, b])                    # replay, a.md closed
         self.assertEqual(docs.open_documents(), ["b.md"])
         self.assertEqual(docs.active_document(), "b.md")
 
     def test_new_pick_alongside_closed_replay_stages_only_the_new(self):
         a = _FakeUpload("a.md", "fid-a")
-        demo._stage_new_uploads([a])
+        app._stage_new_uploads([a])
         docs.remove_document("a.md")
-        demo._stage_new_uploads([a, _FakeUpload("c.md", "fid-c")])
+        app._stage_new_uploads([a, _FakeUpload("c.md", "fid-c")])
         self.assertEqual(docs.open_documents(), ["c.md"])
 
     def test_empty_uploads_drop_the_staging_key(self):
-        demo._stage_new_uploads([_FakeUpload("notes.md", "fid-1")])
-        demo._stage_new_uploads([])
-        self.assertNotIn(demo._LAST_UPLOAD_KEY, st.session_state)
-        demo._stage_new_uploads([])                        # idempotent
-        self.assertNotIn(demo._LAST_UPLOAD_KEY, st.session_state)
+        app._stage_new_uploads([_FakeUpload("notes.md", "fid-1")])
+        app._stage_new_uploads([])
+        self.assertNotIn(app._LAST_UPLOAD_KEY, st.session_state)
+        app._stage_new_uploads([])                        # idempotent
+        self.assertNotIn(app._LAST_UPLOAD_KEY, st.session_state)
 
     def test_fallback_identity_without_file_id(self):
         """Old Streamlits without file_id at least skip in-session duplicates."""
         up = _FakeUpload("notes.md", None)
-        demo._stage_new_uploads([up])
-        demo._stage_new_uploads([up])
+        app._stage_new_uploads([up])
+        app._stage_new_uploads([up])
         self.assertEqual(docs.open_documents(), ["notes.md"])
 
 

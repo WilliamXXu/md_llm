@@ -5,7 +5,7 @@ describing its directories and settings file, then registers it via
 ``md_llm.init(core)`` at startup. Every other md_llm module resolves the host's
 facts through :func:`get_core`, so the package stays host-agnostic and a single
 ``init()`` call rewires it to a different app (transcriber_system, the standalone
-demo, or any other repo).
+app, or any other repo).
 
 The settings store is a plain JSON dict on disk (same shape transcriber_system
 uses, so a host can share one ``settings.json`` between its own panels and
@@ -36,7 +36,7 @@ class Core:
             ``<docstem>__chat_<UTC>.md`` files. Absolute path.
         settings_path: optional JSON file for provider/model/key persistence.
             When ``None`` md_llm keeps settings only in memory (the standalone
-            demo uses this default).
+            app uses this default).
 
     The dataclass is plain data — call :meth:`load_settings` / :meth:`save_settings`
     for persistence, which round-trip a dict through ``settings_path``.
@@ -46,7 +46,7 @@ class Core:
     markdown_dirs: tuple[str, ...]
     chat_save_dir: str
     settings_path: str | None = None
-    # In-memory fallback store used when settings_path is None (the demo) or
+    # In-memory fallback store used when settings_path is None (the app) or
     # unreadable. Callers go through load/save, never touch this directly.
     _memory_store: dict[str, Any] = field(default_factory=dict, repr=False)
 

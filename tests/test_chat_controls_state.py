@@ -1,7 +1,7 @@
 """Tests for the chat panel's control-state snapshot/restore (``md_llm.chat``).
 
 Streamlit prunes a widget's value from session_state when the widget isn't
-rendered on a run. A host that mounts only the active view (the demo's sidebar
+rendered on a run. A host that mounts only the active view (the app's sidebar
 buttons + ``if/else``) would therefore wipe every ``chat_*`` control on a
 Reader -> chat round-trip. The snapshot/restore helpers mirror the chat
 panel's widget values into a non-widget key (which Streamlit does NOT prune)

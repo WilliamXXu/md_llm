@@ -445,7 +445,12 @@ class CloseGuardTests(unittest.TestCase):
             patch("md_llm.docs._confirm_close_document") as confirm,
         ):
             docs.close_document("a.md")
-        confirm.assert_called_once_with("a.md")
+        confirm.assert_called_once()
+        # First arg is the document; the problem list names the chat.
+        self.assertEqual(confirm.call_args[0][0], "a.md")
+        self.assertEqual(
+            confirm.call_args[0][1], ["a non-empty LLM chat"]
+        )
         rerun.assert_not_called()
         self.assertEqual(docs.open_documents(), ["a.md", "b.md"])
 

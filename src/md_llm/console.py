@@ -33,7 +33,7 @@ def log_event(msg: Any, *, level: str = "info", source: str = "") -> None:
 
     No-op (never raises) when no host logger is set — md_llm has no console of
     its own, so without a host there's nowhere for the event to go and that's
-    fine (e.g. the standalone demo).
+    fine (e.g. the standalone app).
     """
     if _logger is None or not msg:
         return

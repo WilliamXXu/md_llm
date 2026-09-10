@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the md_llm demo in Google Chrome (not the macOS default browser).
+# Launch the md_llm app in Google Chrome (not the macOS default browser).
 #
 # Why not just set $BROWSER? On macOS Streamlit opens the URL via the raw
 # `open <url>` command (streamlit/cli_util.py: open_browser -> IS_DARWIN),
@@ -16,14 +16,14 @@ if [[ ! -x "$CHROME" ]]; then
 fi
 
 # streamlit run needs an actual file path (it has no -m / module flag), so
-# resolve demo.py through the installed package rather than hardcoding a path.
-DEMO=$(python -c "import md_llm.demo, os; print(os.path.abspath(md_llm.demo.__file__))") || {
+# resolve app.py through the installed package rather than hardcoding a path.
+APP=$(python -c "import md_llm.app, os; print(os.path.abspath(md_llm.app.__file__))") || {
   echo "Could not import md_llm. Run 'pip install -e .' from the repo root first." >&2
   exit 1
 }
 
 # Sweep stale staged copies from earlier sessions before booting a fresh
-# server. The demo stages every document (uploads and Finder-opened files
+# server. The app stages every document (uploads and Finder-opened files
 # alike) as a top-level file in ~/.md_llm/uploads, and open documents live
 # only in the server process's session memory — so a fresh boot is the one
 # moment nothing references them. Only top-level regular files are deleted:
@@ -38,7 +38,7 @@ LOG=$(mktemp -t md_llm_run)
 trap 'kill "$STREAMLIT_PID" 2>/dev/null || true' EXIT
 
 # Headless = Streamlit will NOT auto-open a browser. We open Chrome ourselves.
-streamlit run "$DEMO" --server.headless=true >"$LOG" 2>&1 &
+streamlit run "$APP" --server.headless=true >"$LOG" 2>&1 &
 STREAMLIT_PID=$!
 
 # Wait for Streamlit to print its Local URL, then hand that exact URL to Chrome.

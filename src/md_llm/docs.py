@@ -52,7 +52,7 @@ import os
 import streamlit as st
 
 from .core import get_core
-from .state import _display_name_for_filepath
+from .state import _display_name_for_filepath, _read_text
 
 # Session-state keys (session-memory only; nothing is persisted).
 _OPEN_DOCS = "_md_llm_open_docs"    # ordered dict: relpath -> None
@@ -508,6 +508,27 @@ def doc_chat_has_messages(rel):
     return False
 
 
+def doc_has_unsaved_edits(rel):
+    """True when the Reader holds an unsaved editor draft for ``rel``.
+
+    Used by :func:`close_document` to warn before a close discards the draft.
+    The draft base key is shared with reader.py by literal string (the same
+    convention as ``_chat_messages``); a draft counts as unsaved when it
+    differs from the file on disk — a missing/unreadable file counts too,
+    since the draft is then the only copy of that text.
+    """
+    draft = st.session_state.get(doc_key("_reader_edit_draft", rel))
+    if draft is None:
+        return False
+    try:
+        full = _resolve_doc_path(rel)
+    except RuntimeError:  # no injected Core (unit tests) — assume unsaved
+        return True
+    if not full or not os.path.isfile(full):
+        return True
+    return _read_text(full) != draft
+
+
 @st.dialog("Document already open")
 def _warn_already_open(rel):
     """Modal warning that a second copy of an open file was refused."""
@@ -519,13 +540,12 @@ def _warn_already_open(rel):
         st.rerun()
 
 
-@st.dialog("Non-empty LLM chat")
-def _confirm_close_document(rel):
-    """Modal asking to proceed with closing a non-empty chat document."""
+@st.dialog("Close with unsaved work")
+def _confirm_close_document(rel, problems):
+    """Modal asking to proceed with closing a document holding unsaved work."""
     st.warning(
-        f"Do you want to proceed with a non-empty LLM chat?\n\n"
-        f"Closing **{_doc_display_name(rel)}** removes its conversation "
-        "from the session."
+        f"Do you want to proceed?\n\nClosing **{_doc_display_name(rel)}** "
+        f"discards {' and '.join(problems)} from the session."
     )
     col_proceed, col_cancel = st.columns(2)
     if col_proceed.button("Close anyway", type="primary"):
@@ -536,15 +556,20 @@ def _confirm_close_document(rel):
 
 
 def close_document(rel):
-    """Close ``rel`` from a button click, guarding a non-empty chat.
+    """Close ``rel`` from a button click, guarding unsaved work.
 
-    With any chat session of the document holding messages, a confirmation
+    With a non-empty LLM chat and/or unsaved Reader edits, a confirmation
     dialog (:func:`_confirm_close_document`) runs first and the document is
     only closed when the user proceeds; otherwise the document closes
     immediately, exactly like ``remove_document`` + rerun before.
     """
+    problems = []
     if doc_chat_has_messages(rel):
-        _confirm_close_document(rel)
+        problems.append("a non-empty LLM chat")
+    if doc_has_unsaved_edits(rel):
+        problems.append("unsaved Reader edits")
+    if problems:
+        _confirm_close_document(rel, problems)
         return
     remove_document(rel)
     st.rerun()
@@ -556,7 +581,7 @@ def render_doc_selector():
     A selectbox (labelled with each document's display name) chooses the
     active document — the Reader and the chat tab follow it — and a Close
     button removes the selected document and its independent chat. Meant for
-    the host's sidebar, next to its file picker; the standalone demo mounts it
+    the host's sidebar, next to its file picker; the standalone app mounts it
     there.
     """
     docs_ = open_documents()

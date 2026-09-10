@@ -90,6 +90,37 @@ with st.sidebar:
     md_llm.render_toc()   # no-op while nothing / a non-.md file is open
 ```
 
+### Optional: in-place editing behind a safety lock
+
+The Reader is read-only by default. Each open document carries a **🔒 Edit
+lock** toggle (right of Clear) that is **on by default** — every fresh session
+and every newly opened document starts locked. Turning the lock off swaps the
+rendered view for a source editor: a draft textarea, **💾 Save** / **Revert**
+buttons, and a preview that refreshes when the editor commits (click outside
+it or ⌘+Enter).
+
+- Saving writes the draft **atomically** to the exact file shown in the
+  Reader's path caption (temp file + rename), through the same
+  ``markdown_dirs`` path guard that gates opening. If the file changed on
+  disk since the draft was opened, a dialog asks before overwriting (a
+  re-copied file with identical content doesn't trigger it).
+- The draft is per-document session state: it survives Reader↔chat switches
+  and document switches, and **closing** a document with unsaved edits (the
+  Reader's Clear or the sidebar ✕) asks before discarding it. Re-locking
+  keeps the draft; unlocking again resumes editing.
+- **⚡ Summarize** always reads the *saved* file — save before summarizing.
+
+```python
+# Nothing to wire up: the lock and editor are part of render_reader().
+# Hosts that want read-only-only behavior simply never surface the toggle's
+# unlocked state (it is per-session and resets to locked on every reload).
+```
+
+Note for the bundled app: files staged by the macOS Finder droplet / file
+uploader are working copies under `~/.md_llm/uploads`, so editing there
+applies to the staged copy — the path caption always names the file a save
+overwrites.
+
 ### Optional: multiple open documents, each with an independent chat
 
 By default one document is open at a time. To open several files — each with
@@ -152,10 +183,13 @@ from md_llm.console import set_logger
 set_logger(my_console.log_event)   # md_llm will call this for chat send/reply/error
 ```
 
-## Standalone demo
+## Standalone app
+
+This is the package's only bundled entry point — there is no other host app
+in this repo.
 
 ```bash
-streamlit run src/md_llm/demo.py
+streamlit run src/md_llm/app.py
 ```
 
 Opens a sidebar file picker (shift-click to pick several); reads + chats about
@@ -188,7 +222,7 @@ src/md_llm/
 ├── controls.py   # provider/model/endpoint widgets + per-endpoint OAI registry
 ├── autossh.py    # optional remote Ollama SSH tunnel panel
 ├── docs.py       # optional multi-document registry + per-doc chat-session registry + sidebar picker
-├── reader.py     # render_reader + render_toc — markdown/text viewer, clickable TOC, ⚡ Summarize quick action
+├── reader.py     # render_reader + render_toc — markdown/text viewer, clickable TOC, ⚡ Summarize quick action, safety-locked in-place editing
 ├── chat.py       # render_chat — streaming multi-turn chat (independent per open doc AND per session)
-└── demo.py       # standalone Streamlit entry point
+└── app.py        # standalone Streamlit app — the package's only UI entry point
 ```

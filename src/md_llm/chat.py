@@ -895,7 +895,7 @@ def _tame_chat_autoscroll():
     ``container.scrollTop = value`` from a rAF loop; the browser's own
     user-driven scrolling never goes through that property setter. So a
     same-origin script (``components.html``, the same escape hatch
-    demo._preserve_reader_scroll and reader._inject_toc_jump use) defines
+    app._preserve_reader_scroll and reader._inject_toc_jump use) defines
     an own ``scrollTop`` accessor on the container that delegates reads
     (measurements stay truthful) but gates writes on a *follow* flag:
 
@@ -1110,7 +1110,7 @@ def _tame_chat_autoscroll():
 #
 # Streamlit drops a widget's value from session_state once that widget is no
 # longer rendered on a run. A host need not mount both panels at once: the
-# standalone demo renders only the active view (sidebar buttons + an
+# standalone app renders only the active view (sidebar buttons + an
 # ``if/else``), and a host app may do the same. So going LLM chat -> Reader ->
 # LLM chat would otherwise reset every ``chat_*`` control (provider, model,
 # endpoint, API key, autossh fields) to its default.

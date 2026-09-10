@@ -80,6 +80,31 @@ def _read_text(path):
         return ""
 
 
+def _write_text(path, text):
+    """Atomically write ``text`` to ``path`` as UTF-8. True on success.
+
+    The content lands via a temp file in the target's directory plus
+    ``os.replace`` (the same pattern ``core.Core.save_settings`` uses), so a
+    crash mid-write can never leave a truncated document behind. Never creates
+    missing directories — editing overwrites an existing file or fails. Returns
+    False (instead of raising) for missing dirs, permission problems, and the
+    like; callers surface a UI error.
+    """
+    if not path:
+        return False
+    try:
+        directory = os.path.dirname(os.path.abspath(path))
+        tmp = os.path.join(
+            directory, f".{os.path.basename(path)}.{os.getpid()}.tmp"
+        )
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
 # Code spans/fences are rendered literally by the markdown processor, so a
 # backslash inside them would show up verbatim — never touch a $ there.
 _CODE_BLOCK_OR_SPAN = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)

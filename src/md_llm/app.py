@@ -1,8 +1,11 @@
-"""Standalone demo: a one-file Streamlit app over any directory of markdown.
+"""Standalone app: a one-file Streamlit app over any directory of markdown.
 
 Run with::
 
-    streamlit run src/md_llm/demo.py
+    streamlit run src/md_llm/app.py
+
+This is the package's only bundled entry point — there is no other host app
+in this repo.
 
 The sidebar has a native Streamlit ``st.file_uploader``: clicking it pops up
 the browser's OS-level file dialog (Finder on macOS, Explorer on Windows, …),
@@ -40,17 +43,17 @@ import streamlit.components.v1 as components
 import md_llm
 
 # Per-user working dir: uploaded files land in ``uploads/``, saved chats in
-# ``uploads/_chats/`` — mirroring the original demo's per-directory layout but
-# rooted at a stable spot the user can find afterwards. Created lazily.
+# ``uploads/_chats/`` — rooted at a stable spot the user can find afterwards.
+# Created lazily.
 _WORK_DIR = Path.home() / ".md_llm"
 _UPLOADS_DIR = _WORK_DIR / "uploads"
 _CHATS_DIR = _UPLOADS_DIR / "_chats"
 _SETTINGS_PATH = _WORK_DIR / "_md_llm_settings.json"
-_LAST_UPLOAD_KEY = "_demo_last_uploaded_name"
+_LAST_UPLOAD_KEY = "_app_last_uploaded_name"
 
 
 def _ensure_work_dirs():
-    """Create the working directories used by the demo (idempotent)."""
+    """Create the app's working directories (idempotent)."""
     _UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     _CHATS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -488,7 +491,7 @@ def _stage_new_uploads(uploaded):
 
 
 def main():
-    st.set_page_config(page_title="md_llm demo", layout="wide", page_icon="📖")
+    st.set_page_config(page_title="md_llm", layout="wide", page_icon="📖")
     _ensure_work_dirs()
     _install_core()
     _open_query_docs()
@@ -503,7 +506,7 @@ def main():
         # chips) — leaving just a compact square "+" Browse button. The CSS is
         # scoped to this keyed container so the nav / Contents buttons below (and
         # every other sidebar button) keep their default style.
-        with st.container(key="_demo_upload"):
+        with st.container(key="_app_upload"):
             st.markdown(
                 "<style>"
                 "[data-testid=\"stSidebar\"] [data-testid=\"stLogoSpacer\"]{"
@@ -520,16 +523,16 @@ def main():
                 "[data-testid=\"stVerticalBlock\"]{gap:0.25rem!important}"
                 "[data-testid=\"stSidebar\"] "
                 "[data-testid=\"stHorizontalBlock\"]{gap:0.3rem!important}"
-                ".st-key-_demo_upload [data-testid=\"stFileUploader\"]{"
+                ".st-key-_app_upload [data-testid=\"stFileUploader\"]{"
                 "margin:0!important}"
-                ".st-key-_demo_upload [data-testid=\"stFileUploader\"]>label{"
+                ".st-key-_app_upload [data-testid=\"stFileUploader\"]>label{"
                 "display:none!important}"
                 # Strip the drop-zone box down to its Browse button.
-                ".st-key-_demo_upload [data-testid=\"stFileUploaderDropzone\"]{"
+                ".st-key-_app_upload [data-testid=\"stFileUploaderDropzone\"]{"
                 "border:0!important;background:transparent!important;"
                 "padding:0!important;min-height:0!important;height:auto!important}"
                 # Hide the instructions / empty-state text.
-                ".st-key-_demo_upload "
+                ".st-key-_app_upload "
                 "[data-testid=\"stFileUploaderDropzoneInstructions\"]{"
                 "display:none!important}"
                 # Hide each selected-file chip (name + size), but NOT the
@@ -537,7 +540,7 @@ def main():
                 # replaces the Upload button with the chips list, and renders
                 # the "Add files" (+) button INSIDE that container — so hiding
                 # the container would hide the only remaining way to add files.
-                ".st-key-_demo_upload [data-testid=\"stFileChip\"]{"
+                ".st-key-_app_upload [data-testid=\"stFileChip\"]{"
                 "display:none!important}"
                 # Hiding the chip alone is not enough: Streamlit (1.58) wraps
                 # each chip in a testid-less row div, and those zero-height
@@ -549,7 +552,7 @@ def main():
                 # stFileChips — the "+" button is its BUTTON sibling) so the
                 # uploader's height stays constant no matter how many files
                 # were picked.
-                ".st-key-_demo_upload [data-testid=\"stFileChips\"]>div{"
+                ".st-key-_app_upload [data-testid=\"stFileChips\"]>div{"
                 "display:none!important}"
                 # Turn the lone button in here into a compact square "+". This
                 # covers both states: the pre-upload "Upload" button and the
@@ -557,13 +560,13 @@ def main():
                 # material "+" icon). Hide every inner element (label text AND
                 # icon — font-size:0 alone can't remove an SVG icon) so the
                 # ::after "+" is the only thing shown.
-                ".st-key-_demo_upload button{"
+                ".st-key-_app_upload button{"
                 "width:2.5rem!important;height:2.5rem!important;"
                 "min-width:2.5rem!important;padding:0!important;margin:0!important;"
                 "font-size:0!important;display:inline-flex!important;"
                 "align-items:center!important;justify-content:center!important}"
-                ".st-key-_demo_upload button>*{display:none!important}"
-                ".st-key-_demo_upload button::after{"
+                ".st-key-_app_upload button>*{display:none!important}"
+                ".st-key-_app_upload button::after{"
                 "content:\"+\"!important;font-size:1.5rem!important;"
                 "font-weight:700!important;line-height:1!important}"
                 "</style>",
@@ -597,32 +600,32 @@ def main():
         # st.session_state[TABS_KEY] (also driven by open_in_reader() and the
         # Reader's "Send to chat"), so clicking a button just writes that key
         # and reruns. The CSS enlarges + centers the sidebar button labels —
-        # scoped to this keyed container (st-key-_demo_nav) so the Contents
+        # scoped to this keyed container (st-key-_app_nav) so the Contents
         # buttons below keep their default size.
         # Open-document switch buttons (one per open document). Font halved
         # from the earlier 1.18rem so long filenames fit without overflowing;
-        # scoped to _demo_docs so the "LLM chat" button and the Contents
+        # scoped to _app_docs so the "LLM chat" button and the Contents
         # buttons keep their own sizes.
-        with st.container(key="_demo_docs"):
+        with st.container(key="_app_docs"):
             st.markdown(
                 "<style>"
-                ".st-key-_demo_docs{margin-top:0.2rem!important}"
-                ".st-key-_demo_docs button{"
+                ".st-key-_app_docs{margin-top:0.2rem!important}"
+                ".st-key-_app_docs button{"
                 "font-size:0.59rem!important;font-weight:600!important;"
                 "padding-top:0.15rem!important;padding-bottom:0.15rem!important;"
                 "margin-top:0.1rem!important;margin-bottom:0.1rem!important}"
-                ".st-key-_demo_docs button *{font-size:inherit!important}"
+                ".st-key-_app_docs button *{font-size:inherit!important}"
                 "</style>",
                 unsafe_allow_html=True,
             )
             md_llm.render_doc_buttons()
-        with st.container(key="_demo_nav"):
+        with st.container(key="_app_nav"):
             st.markdown(
                 "<style>"
-                ".st-key-_demo_nav{margin-top:0.3rem!important}"
-                ".st-key-_demo_nav button{"
+                ".st-key-_app_nav{margin-top:0.3rem!important}"
+                ".st-key-_app_nav button{"
                 "font-size:0.95rem!important;font-weight:600!important}"
-                ".st-key-_demo_nav button *{font-size:inherit!important}"
+                ".st-key-_app_nav button *{font-size:inherit!important}"
                 "</style>",
                 unsafe_allow_html=True,
             )

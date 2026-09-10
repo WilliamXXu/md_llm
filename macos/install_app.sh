@@ -1,9 +1,9 @@
 #!/bin/bash
 # Build and install the md_llm.app Finder droplet — the "Mac app" that lets
 # you double-click (or "Open With") a .md/.markdown file and have it open in
-# the md_llm demo: an AppleScript applet (macos/main.applescript) that
+# the md_llm app: an AppleScript applet (macos/main.applescript) that
 # forwards the file to Contents/Resources/launcher.sh (macos/launcher.sh),
-# which stages it into ~/.md_llm/uploads, boots the Streamlit demo server if
+# which stages it into ~/.md_llm/uploads, boots the Streamlit app server if
 # it isn't up, and opens the browser at /?open=<name>.
 #
 # The bundle is a local artifact, never committed — rebuild it on each
