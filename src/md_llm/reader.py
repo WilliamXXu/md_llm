@@ -11,9 +11,14 @@ summary prompt).
 
 In-place editing is gated behind a **safety lock** (the "🔒 Edit lock" toggle in
 the action row): the lock is ON by default — every document starts read-only —
-and turning it off swaps the rendered view for a source editor (draft
-textarea + 💾 Save / Revert + a preview that refreshes on commit). Saving
-writes the draft through the same path guard that gates opening, atomically
+and turning it off keeps the document fully rendered and makes it editable in
+place: every rendered block (heading, paragraph, list, table, quote, fence…)
+grows a hover "✎" handle; clicking one swaps just that block for a small
+source editor (Done / Cancel) while the rest of the document stays rendered
+around it, and committing splices the block's source back into the draft. A
+collapsed "Raw source" expander keeps the whole-file textarea for bulk
+restructuring; text files keep a plain split editor. Saving writes the draft
+through the same path guard that gates opening, atomically
 (:func:`md_llm.state._write_text`), and confirms first when the file changed
 on disk since the draft was opened. The draft is per-document session state;
 closing a document that still differs from disk asks before discarding it.
@@ -40,6 +45,7 @@ import re
 
 import streamlit as st
 import streamlit.components.v1 as components
+from markdown_it import MarkdownIt
 
 from . import docs
 from .core import get_core
@@ -69,14 +75,55 @@ _READER_TARGET = "_reader_target"
 # start editable.
 _EDIT_UNLOCKED = "_reader_edit_unlocked"      # non-widget mirror (absent = locked)
 _EDIT_LOCK_TOGGLE = "_reader_edit_lock"       # st.toggle widget key
-_EDIT_AREA = "_reader_edit_area"              # st.text_area widget key (the draft)
+_EDIT_AREA = "_reader_edit_area"              # whole-file st.text_area widget key
 _EDIT_DRAFT = "_reader_edit_draft"            # non-widget mirror of the draft
 _EDIT_BASE_MTIME = "_reader_edit_base_mtime"  # mtime the draft was seeded from
 _EDIT_PENDING = "_reader_edit_pending"        # draft stashed for the conflict dialog
+_EDIT_BLOCK_INDEX = "_reader_edit_block_index"  # doc-scoped: block open in the
+                                                # in-place editor (absent = none)
+_EDIT_BLOCK_AREA = "_reader_edit_block_area"    # doc-scoped: the in-place block
+                                                # editor's st.text_area widget key
+_EDIT_AREA_GEN = "_reader_edit_area_gen"        # doc-scoped: raw textarea key
+                                                # generation (see _bump_raw_area)
 
 # Above this many characters the editor shows a "may be slow" notice (the
 # text_area widget degrades on very large documents).
 _EDIT_SIZE_WARN = 400_000
+
+# CSS for the in-place block editor. Each rendered block sits in a keyed
+# container (`_reader_blk_<i>`) made position:relative; its "✎" handle
+# (`_reader_blk_btn_<i>`) is absolutely positioned in the block's top-right
+# corner and invisible until the block is hovered/focused, so the document
+# reads exactly like the locked view until the reader reaches for a block.
+# The blocks area also tightens Streamlit's inter-element gap so stacked
+# blocks keep the whole-document rhythm.
+_BLOCKS_CSS = """
+[class*="st-key-_reader_blocks_area"] [data-testid="stVerticalBlock"] {
+    gap: 0.3rem !important;
+}
+[class*="st-key-_reader_blk_"] { position: relative; }
+[class*="st-key-_reader_blk_btn_"] {
+    position: absolute !important;
+    top: 0.05rem;
+    right: 0;
+    z-index: 20;
+    opacity: 0;
+    transition: opacity 0.12s ease-in-out;
+}
+[class*="st-key-_reader_blk_btn_"] button {
+    min-height: 1.35rem !important;
+    height: 1.35rem !important;
+    padding: 0 0.45rem !important;
+    margin: 0 !important;
+    font-size: 0.7rem !important;
+    line-height: 1.2 !important;
+}
+[class*="st-key-_reader_blk_btn_"] button > div { padding: 0 !important; }
+[class*="st-key-_reader_blk_"]:hover [class*="st-key-_reader_blk_btn_"],
+[class*="st-key-_reader_blk_"]:focus-within [class*="st-key-_reader_blk_btn_"] {
+    opacity: 1;
+}
+"""
 
 # The ⚡ Summarize quick action's prompt, staged for the NEXT chat turn of the
 # ACTIVE document + chat session. Shared by string literal (the chat panel
@@ -320,18 +367,50 @@ def _mirror_edit_lock():
         st.session_state[docs.doc_key(_EDIT_UNLOCKED, rel)] = True
 
 
+def _raw_area_key(rel):
+    """Session key of the whole-file textarea's CURRENT generation.
+
+    The generation is part of the widget key (before the ``__doc__`` suffix,
+    so the close-time sweep still matches) — see :func:`_bump_raw_area` for
+    why it exists.
+    """
+    gen = st.session_state.get(docs.doc_key(_EDIT_AREA_GEN, rel), 0)
+    return docs.doc_key(f"{_EDIT_AREA}__g{gen}", rel)
+
+
+def _bump_raw_area(rel):
+    """Rotate the whole-file textarea's widget key after a programmatic reset.
+
+    Streamlit widgets belong to the browser once mounted: a server-side
+    re-seed of a mounted widget's key does not reach the client, and the
+    client's next widget-state snapshot silently reverts the server value —
+    replaying the OLD whole-file text and, through the on_change mirror,
+    clobbering the block edits in the draft. Rotating the key forces a
+    remount, so the textarea comes back displaying the fresh draft and the
+    client can never replay a stale copy.
+    """
+    old_key = _raw_area_key(rel)
+    key = docs.doc_key(_EDIT_AREA_GEN, rel)
+    st.session_state[key] = st.session_state.get(key, 0) + 1
+    st.session_state.pop(old_key, None)
+
+
 def _mirror_edit_draft():
-    """on_change for the draft textarea: mirror the edit into the draft key.
+    """on_change for the whole-file textarea: mirror the edit into the draft key.
 
     Streamlit fires widget callbacks only after the widget's new value is in
     session state, so the mirror is always at least as fresh as the last
     committed edit — which is what the dirty checks (that run in widget order,
-    possibly BEFORE the textarea re-instantiates) rely on.
+    possibly BEFORE the textarea re-instantiates) rely on. A whole-file edit
+    also closes any open block editor: the raw text just replaced the draft
+    that editor was splicing into.
     """
     rel = _current_edit_doc()
     st.session_state[docs.doc_key(_EDIT_DRAFT, rel)] = st.session_state.get(
-        docs.doc_key(_EDIT_AREA, rel), ""
+        _raw_area_key(rel), ""
     )
+    st.session_state.pop(docs.doc_key(_EDIT_BLOCK_INDEX, rel), None)
+    st.session_state.pop(docs.doc_key(_EDIT_BLOCK_AREA, rel), None)
 
 
 def _doc_edit_dirty(rel):
@@ -354,9 +433,28 @@ def _doc_edit_dirty(rel):
 
 
 def _pop_edit_state(rel):
-    """Drop every editor key of ``rel`` (draft, widget value, mtime, lock)."""
-    for base in (_EDIT_DRAFT, _EDIT_AREA, _EDIT_BASE_MTIME, _EDIT_UNLOCKED):
+    """Drop every editor key of ``rel`` (draft, widget values, mtime, lock)."""
+    for base in (
+        _EDIT_DRAFT, _EDIT_AREA, _EDIT_AREA_GEN, _EDIT_BASE_MTIME,
+        _EDIT_UNLOCKED, _EDIT_BLOCK_INDEX, _EDIT_BLOCK_AREA,
+    ):
         st.session_state.pop(docs.doc_key(base, rel), None)
+    _pop_raw_area_generations(rel)
+
+
+def _pop_raw_area_generations(rel):
+    """Drop every generation of the whole-file textarea's widget key.
+
+    The key carries a generation (``_reader_edit_area__g<N>``), so name-based
+    cleanup sweeps them by prefix; multi-document closes get this for free
+    from the ``__doc__`` suffix sweep.
+    """
+    suffix = docs.doc_key(_EDIT_AREA, rel)
+    for k in [
+        k for k in st.session_state
+        if isinstance(k, str) and k.startswith(f"{suffix}__g")
+    ]:
+        st.session_state.pop(k, None)
 
 
 def _write_doc_edit(rel, target, draft):
@@ -385,12 +483,13 @@ def _write_doc_edit(rel, target, draft):
 def _save_doc_edit():
     """💾 Save handler: write the editor draft to the file on disk.
 
-    Reads the textarea's session value directly (the button renders after the
-    textarea, so the value is this run's freshest). When the file changed on
-    disk since the draft was opened — and the content really differs, since
-    the macOS launcher re-copies dropped files (bumping mtime) without
-    changing them — a confirmation dialog stands between the draft and the
-    outside changes.
+    The draft is the whole-file textarea's value when the raw editor is
+    mounted (the freshest copy — its pending edit lands in session state with
+    the click), else the block editor's draft mirror. When the file changed
+    on disk since editing started — and the content really differs, since the
+    macOS launcher re-copies dropped files (bumping mtime) without changing
+    them — a confirmation dialog stands between the draft and the outside
+    changes.
     """
     rel = _current_edit_doc()
     # The file to write is whatever the Reader is displaying (_READER_TARGET);
@@ -400,7 +499,9 @@ def _save_doc_edit():
     if not target or not os.path.isfile(target):
         st.error("The file no longer exists on disk — cannot save.")
         return
-    draft = st.session_state.get(docs.doc_key(_EDIT_AREA, rel))
+    draft = st.session_state.get(_raw_area_key(rel))
+    if draft is None:
+        draft = st.session_state.get(docs.doc_key(_EDIT_DRAFT, rel))
     if draft is None:
         return
     base_mtime = st.session_state.get(docs.doc_key(_EDIT_BASE_MTIME, rel))
@@ -434,8 +535,10 @@ def _confirm_save_over_changed_file(rel, target):
         if draft is not None and _write_doc_edit(rel, target, draft):
             st.rerun()
     if col_reload.button("Reload from disk"):
-        for base in (_EDIT_DRAFT, _EDIT_AREA, _EDIT_BASE_MTIME):
+        for base in (_EDIT_DRAFT, _EDIT_BASE_MTIME,
+                     _EDIT_BLOCK_INDEX, _EDIT_BLOCK_AREA):
             st.session_state.pop(docs.doc_key(base, rel), None)
+        _bump_raw_area(rel)
         st.session_state.pop(_EDIT_PENDING, None)
         st.rerun()
     if col_cancel.button("Cancel"):
@@ -495,29 +598,267 @@ def _render_edit_lock(rel):
     )
 
 
-def _render_editor(target, text):
-    """The unlocked editor: draft textarea + 💾 Save / Revert + preview.
+# --- block splitting (the in-place editor's source of block boundaries) -----
 
-    The textarea is seeded pre-mount from the draft mirror (an edit in
-    progress from before a view switch) or from the file — never with
-    ``value=``, which would trip Streamlit's default-value-vs-session-state
-    policy once the key exists. The base mtime is recorded when the draft is
-    first opened so the save can detect outside changes.
+_MD_PARSER = None
+
+
+def _md_parser():
+    """The block splitter's parser, created once per session.
+
+    CommonMark plus the table/strikethrough rulesets — the constructs
+    ``st.markdown`` renders — so block boundaries never cut through a
+    construct the renderer draws as one piece.
+    """
+    global _MD_PARSER
+    if _MD_PARSER is None:
+        _MD_PARSER = MarkdownIt("commonmark").enable(["table", "strikethrough"])
+    return _MD_PARSER
+
+
+def _md_blocks(text):
+    """Split markdown into its top-level blocks for the in-place editor.
+
+    Returns ``(blocks, refs_src)``. Blocks are ``(start, end, source)`` with
+    half-open line ranges into ``text``: a whole list/table/quote/fence is one
+    block, and the blank lines between blocks belong to no block — so splicing
+    a replacement over a block's lines can never eat a separator. ``refs_src``
+    is the source of every link-reference definition; the block renderer
+    prepends it to each block so per-block rendering still resolves
+    ``[text][ref]`` links (definitions themselves render nothing).
+    """
+    lines = text.splitlines(keepends=True)
+    env = {}
+    ranges = []
+    last = None
+    for tok in _md_parser().parse(text, env):
+        if tok.level or tok.map is None or tok.type == "inline":
+            continue
+        if tok.map != last:
+            ranges.append((tok.map[0], tok.map[1]))
+            last = tok.map
+    blocks = [
+        (s, e, "".join(lines[s:e])) for s, e in ranges if s < len(lines)
+    ]
+    refs_src = "".join(
+        "".join(lines[ref["map"][0]:ref["map"][1]])
+        for ref in env.get("references", {}).values()
+        if ref.get("map") and ref["map"][0] < len(lines)
+    )
+    return blocks, refs_src
+
+
+def _current_draft(rel, text):
+    """The text the unlocked view renders and edits: the unsaved draft if one
+    exists (so committed block edits are visible), else ``text`` from disk."""
+    draft = st.session_state.get(docs.doc_key(_EDIT_DRAFT, rel))
+    return text if draft is None else draft
+
+
+# --- in-place block editing --------------------------------------------------
+
+def _open_block_edit(index):
+    """✎ handle handler: open the in-place editor for block ``index``.
+
+    The block textarea's key is shared by every block of the document (only
+    one editor is open at a time) and popped here so the editor re-seeds from
+    the freshly selected block instead of a previous block's text.
     """
     rel = _current_edit_doc()
-    st.caption(
-        "**Editing unlocked** — changes stay in this browser until you save. "
-        "💾 Save overwrites the file on disk at the path shown above; "
-        "⚡ Summarize always reads the saved file."
-    )
-    if len(text) > _EDIT_SIZE_WARN:
-        st.warning(
-            "This document is very large — the editor may feel slow."
+    st.session_state[docs.doc_key(_EDIT_BLOCK_INDEX, rel)] = index
+    st.session_state.pop(docs.doc_key(_EDIT_BLOCK_AREA, rel), None)
+    st.rerun()
+
+
+def _commit_block_edit():
+    """Commit the open block editor: splice its source back into the draft.
+
+    Runs on Done and on the textarea's own commit (blur / ⌘+Enter), so
+    clicking anywhere else lands the edit first. The block's line range is
+    looked up in the text the block view currently renders — the draft, else
+    the file — the replacement is spliced over exactly those lines, and the
+    editor closes (an unchanged block just closes). The whole-file textarea
+    is dropped on any real change so it re-seeds from the updated draft
+    instead of holding a stale pre-splice copy.
+    """
+    rel = _current_edit_doc()
+    idx_key = docs.doc_key(_EDIT_BLOCK_INDEX, rel)
+    area_key = docs.doc_key(_EDIT_BLOCK_AREA, rel)
+    index = st.session_state.get(idx_key)
+    new_src = st.session_state.get(area_key)
+    st.session_state.pop(idx_key, None)
+    st.session_state.pop(area_key, None)
+    if index is None or new_src is None:
+        return
+    draft = st.session_state.get(docs.doc_key(_EDIT_DRAFT, rel))
+    if draft is None:
+        target = _resolve_reader_target(st.session_state.get(_READER_TARGET))
+        draft = _read_text(target) if target else ""
+    blocks, _refs = _md_blocks(draft)
+    if index >= len(blocks):
+        return
+    start, end, old_src = blocks[index]
+    if new_src != old_src:
+        lines = draft.splitlines(keepends=True)
+        # Keep the block's separators: a final line without a newline would
+        # fuse with whatever follows, and blocks that absorb their trailing
+        # blank line (lists do) must hand it back if the replacement lacks it.
+        missing_tail = len(old_src) - len(old_src.rstrip("\n")) - (
+            len(new_src) - len(new_src.rstrip("\n"))
         )
-    area_key = docs.doc_key(_EDIT_AREA, rel)
+        if missing_tail > 0 and end < len(lines):
+            new_src += "\n" * missing_tail
+        new_lines = new_src.splitlines(keepends=True)
+        if new_lines and not new_lines[-1].endswith("\n") and end < len(lines):
+            new_lines[-1] += "\n"
+        draft = "".join(lines[:start] + new_lines + lines[end:])
+        st.session_state[docs.doc_key(_EDIT_DRAFT, rel)] = draft
+        _bump_raw_area(rel)
+    st.rerun()
+
+
+def _cancel_block_edit():
+    """Close the in-place block editor without splicing anything.
+
+    Edits already committed elsewhere stay; only the open editor's
+    uncommitted textarea content is discarded.
+    """
+    rel = _current_edit_doc()
+    for base in (_EDIT_BLOCK_INDEX, _EDIT_BLOCK_AREA):
+        st.session_state.pop(docs.doc_key(base, rel), None)
+    st.rerun()
+
+
+def _render_block_edit_row(rel, src):
+    """The in-place editor that replaces one rendered block: a textarea sized
+    to the block plus Done / Cancel. Commits go through :func:`_commit_block_edit`
+    (the textarea's on_change), so blur and ⌘+Enter land the edit too."""
+    area_key = docs.doc_key(_EDIT_BLOCK_AREA, rel)
+    if area_key not in st.session_state:
+        st.session_state[area_key] = src
+    n_lines = max(1, len(src.rstrip("\n").splitlines()))
+    st.text_area(
+        "Block source",
+        key=area_key,
+        height=min(max(76, n_lines * 26 + 26), 620),
+        label_visibility="collapsed",
+        on_change=_commit_block_edit,
+    )
+    col_done, col_cancel, _spare = st.columns([1, 1, 4])
+    with col_done:
+        if st.button("Done", type="primary", key="_reader_blk_done_btn"):
+            _commit_block_edit()
+    with col_cancel:
+        if st.button("Cancel", key="_reader_blk_cancel_btn"):
+            _cancel_block_edit()
+
+
+def _render_blocks(text, rel):
+    """The unlocked .md view: the document fully rendered, editable in place.
+
+    Every top-level block is one unit — hovering it reveals a "✎" handle,
+    clicking swaps just that block for a small source editor, and committing
+    splices the block's source back into the draft (see
+    :func:`_commit_block_edit`). Blocks are re-parsed from the current text
+    on every run, so committed edits can never desync the indices.
+    """
+    draft = _current_draft(rel, text)
+    blocks, refs_src = _md_blocks(draft)
+    idx_key = docs.doc_key(_EDIT_BLOCK_INDEX, rel)
+    editing = st.session_state.get(idx_key)
+    if editing is not None and not 0 <= editing < len(blocks):
+        st.session_state.pop(idx_key, None)
+        editing = None
+    st.markdown(f"<style>{_BLOCKS_CSS}</style>", unsafe_allow_html=True)
+    if not blocks:
+        st.caption("_Nothing to edit block-by-block — use Raw source below._")
+    with st.container(key="_reader_blocks_area"):
+        for i, (_s, _e, src) in enumerate(blocks):
+            with st.container(key=f"_reader_blk_{i}"):
+                if editing == i:
+                    _render_block_edit_row(rel, src)
+                    continue
+                if st.button("✎", key=f"_reader_blk_btn_{i}"):
+                    _open_block_edit(i)
+                st.markdown(
+                    _escape_currency_dollars(refs_src + src),
+                    unsafe_allow_html=True,
+                )
+
+
+def _render_raw_editor(rel, text, in_expander, height=400):
+    """The whole-file source textarea.
+
+    For markdown it lives in a collapsed expander (the block editor is the
+    primary interface; the raw textarea covers bulk restructuring); text
+    files render it plainly as their only editor. Seeded pre-mount from the
+    draft mirror (an edit in progress from before a view switch) or from the
+    file — never with ``value=``, which would trip Streamlit's
+    default-value-vs-session-state policy once the key exists. The key carries
+    a generation (:func:`_bump_raw_area`) so block edits can swap the mounted
+    textarea over to the fresh draft instead of being reverted by the client.
+    """
+    area_key = _raw_area_key(rel)
     if area_key not in st.session_state:
         st.session_state[area_key] = st.session_state.get(
             docs.doc_key(_EDIT_DRAFT, rel), text
+        )
+
+    def textarea():
+        st.text_area(
+            "Raw source",
+            key=area_key,
+            height=height,
+            label_visibility="collapsed",
+            on_change=_mirror_edit_draft,
+        )
+
+    if in_expander:
+        with st.expander("Raw source", expanded=False):
+            st.caption(
+                "_Whole-file source — commits on click-outside / ⌘+Enter; "
+                "committing closes any open block editor._"
+            )
+            textarea()
+    else:
+        textarea()
+
+
+def _revert_doc_edit(rel):
+    """Revert handler: drop the draft and every editor, re-seed from disk."""
+    for base in (_EDIT_DRAFT, _EDIT_BASE_MTIME,
+                 _EDIT_BLOCK_INDEX, _EDIT_BLOCK_AREA):
+        st.session_state.pop(docs.doc_key(base, rel), None)
+    _bump_raw_area(rel)
+    st.rerun()
+
+
+def _render_editor(target, text):
+    """The unlocked editor: the document stays rendered, edits happen in place.
+
+    Markdown files get the block editor (:func:`_render_blocks`) plus the
+    collapsed raw-source expander; text files keep a split editor (the raw
+    textarea beside a code-block preview). Both feed the same draft mirror,
+    so the dirty checks and 💾 Save work identically. The base mtime is
+    recorded when editing starts so the save can detect outside changes.
+    """
+    rel = _current_edit_doc()
+    if target.endswith(".md"):
+        st.caption(
+            "**Editing unlocked** — hover a block and click its ✎ handle to "
+            "edit it right in the document. Changes stay in this browser "
+            "until you 💾 Save (which overwrites the file at the path shown "
+            "above); ⚡ Summarize always reads the saved file."
+        )
+    else:
+        st.caption(
+            "**Editing unlocked** — changes stay in this browser until you "
+            "save. 💾 Save overwrites the file on disk at the path shown "
+            "above; ⚡ Summarize always reads the saved file."
+        )
+    if len(text) > _EDIT_SIZE_WARN:
+        st.warning(
+            "This document is very large — the editor may feel slow."
         )
     mtime_key = docs.doc_key(_EDIT_BASE_MTIME, rel)
     if mtime_key not in st.session_state:
@@ -525,31 +866,24 @@ def _render_editor(target, text):
             st.session_state[mtime_key] = os.path.getmtime(target)
         except OSError:
             pass
-    st.text_area(
-        "Source",
-        key=area_key,
-        height=560,
-        label_visibility="collapsed",
-        on_change=_mirror_edit_draft,
-    )
     col_save, col_revert, _spare = st.columns([1, 1, 4])
     with col_save:
         if st.button("💾 Save", type="primary", key="_reader_edit_save_btn"):
             _save_doc_edit()
     with col_revert:
         if st.button("Revert", key="_reader_edit_revert_btn"):
-            for base in (_EDIT_DRAFT, _EDIT_AREA, _EDIT_BASE_MTIME):
-                st.session_state.pop(docs.doc_key(base, rel), None)
-            st.rerun()
-    st.caption(
-        "_Preview — updates when the editor commits (click outside it or "
-        "⌘+Enter)._"
-    )
-    draft_now = st.session_state.get(area_key, text)
+            _revert_doc_edit(rel)
     if target.endswith(".md"):
-        st.markdown(_escape_currency_dollars(draft_now), unsafe_allow_html=True)
+        _render_blocks(text, rel)
+        _render_raw_editor(rel, text, in_expander=True)
     else:
-        st.code(draft_now, language="text")
+        col_src, col_view = st.columns([1, 1], gap="medium")
+        with col_src:
+            st.caption("_Source — commits on click-outside / ⌘+Enter._")
+            _render_raw_editor(rel, text, in_expander=False, height=560)
+        with col_view:
+            st.caption("_Preview — the file as the Reader renders it._")
+            st.code(_current_draft(rel, text), language="text")
 
 
 # Markdown constructs stripped when converting a heading line to its plain
@@ -924,10 +1258,11 @@ def render_reader():
     # render alongside standard **bold** markdown — without it Streamlit strips
     # the tags and shows their inner text unstyled.
     #
-    # With the safety lock off, the rendered view gives way to the editor (the
-    # preview at its bottom covers the read); locked, the file is read-only
-    # and rendered exactly as before. Lock state is keyed by the active
-    # document (see _current_edit_doc), never by the raw target.
+    # With the safety lock off, the document stays rendered and becomes
+    # editable in place: block-level ✎ handles plus a raw-source expander for
+    # .md, a split editor for text files; locked, the file is read-only and
+    # rendered exactly as before. Lock state is keyed by the active document
+    # (see _current_edit_doc), never by the raw target.
     if _edit_unlocked(_current_edit_doc()):
         _render_editor(target, text)
     elif target.endswith(".md"):
@@ -960,8 +1295,12 @@ def _close_reader():
         # In single-document mode the editor keys are the legacy bare keys —
         # dropped by name (multi-doc copies carry the __doc__ suffix and are
         # swept by remove_document above).
-        for base in (_EDIT_DRAFT, _EDIT_AREA, _EDIT_BASE_MTIME, _EDIT_UNLOCKED):
+        for base in (
+            _EDIT_DRAFT, _EDIT_AREA, _EDIT_AREA_GEN, _EDIT_BASE_MTIME,
+            _EDIT_UNLOCKED, _EDIT_BLOCK_INDEX, _EDIT_BLOCK_AREA,
+        ):
             st.session_state.pop(base, None)
+        _pop_raw_area_generations("")
         # In single-document mode, clear the staged quick prompt (legacy bare
         # key shared by every chat session of this now-closed document).
         for sid in docs.chat_sessions(""):

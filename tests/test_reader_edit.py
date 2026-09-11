@@ -176,24 +176,35 @@ class CloseCleanupTests(unittest.TestCase):
         for base in (
             "_reader_edit_draft",
             "_reader_edit_area",
+            "_reader_edit_area__g0",
+            "_reader_edit_area__g1",
+            "_reader_edit_area_gen",
             "_reader_edit_base_mtime",
             "_reader_edit_unlocked",
+            "_reader_edit_block_index",
+            "_reader_edit_block_area",
         ):
             st.session_state[base] = "x"
         reader._close_reader()
         self.assertNotIn("_reader_target", st.session_state)
-        for base in (
+        for key in (
             "_reader_edit_draft",
             "_reader_edit_area",
+            "_reader_edit_area__g0",
+            "_reader_edit_area__g1",
+            "_reader_edit_area_gen",
             "_reader_edit_base_mtime",
             "_reader_edit_unlocked",
+            "_reader_edit_block_index",
+            "_reader_edit_block_area",
         ):
-            self.assertNotIn(base, st.session_state)
+            self.assertNotIn(key, st.session_state)
 
     def test_multi_document_close_sweeps_suffixed_editor_keys(self):
         docs.add_document("a.md")
         docs.add_document("b.md")
-        for base in ("_reader_edit_draft", "_reader_edit_unlocked"):
+        for base in ("_reader_edit_draft", "_reader_edit_unlocked",
+                     "_reader_edit_area__g2", "_reader_edit_area_gen"):
             st.session_state[docs.doc_key(base, "a.md")] = "x"
         docs.remove_document("a.md")
         self.assertNotIn(
@@ -201,6 +212,14 @@ class CloseCleanupTests(unittest.TestCase):
         )
         self.assertNotIn(
             docs.doc_key("_reader_edit_unlocked", "a.md"), st.session_state
+        )
+        # Rotated raw-textarea keys end with the doc suffix too, so the
+        # suffix sweep catches every generation.
+        self.assertNotIn(
+            docs.doc_key("_reader_edit_area__g2", "a.md"), st.session_state
+        )
+        self.assertNotIn(
+            docs.doc_key("_reader_edit_area_gen", "a.md"), st.session_state
         )
         # A different document's editor state is untouched.
         docs.add_document("c.md")
@@ -219,6 +238,9 @@ class CloseCleanupTests(unittest.TestCase):
             "_reader_edit_base_mtime",
             "_reader_edit_unlocked",
             "_reader_edit_lock",
+            "_reader_edit_block_index",
+            "_reader_edit_block_area",
+            "_reader_edit_area_gen",
         ):
             self.assertEqual(
                 docs.doc_key(base, "a.md"), f"{base}__doc__a.md"
@@ -270,6 +292,19 @@ class _HostAppTest(unittest.TestCase):
         except KeyError:
             return None
 
+    def _raw_key(self, at, doc=""):
+        """The whole-file textarea's current (generation-carrying) widget key.
+
+        The key rotates whenever the draft is reset programmatically (block
+        commit / revert / reload), so tests resolve it from session state
+        instead of hardcoding ``_reader_edit_area``.
+        """
+        gen = self._sget(
+            at, f"_reader_edit_area_gen{f'__doc__{doc}' if doc else ''}"
+        ) or 0
+        base = f"_reader_edit_area__g{gen}"
+        return f"{base}__doc__{doc}" if doc else base
+
 
 class LockDefaultAppTests(_HostAppTest):
     def setUp(self):
@@ -285,19 +320,19 @@ class LockDefaultAppTests(_HostAppTest):
         self.assertIsNone(self._element(self.at, "button", "_reader_edit_save_btn"))
         # The quick-prompt expander owns a text_area; the editor's is absent.
         with self.assertRaises(KeyError):
-            self.at.text_area(key="_reader_edit_area")
+            self.at.text_area(key=self._raw_key(self.at))
 
     def test_unlock_renders_editor_seeded_from_disk(self):
         self.at.session_state["_reader_edit_unlocked"] = True
         self.at.run()
-        editor = self._element(self.at, "text_area", "_reader_edit_area")
+        editor = self._element(self.at, "text_area", self._raw_key(self.at))
         self.assertIsNotNone(editor)
         self.assertEqual(editor.value, "on disk\n")
 
     def test_save_writes_disk_and_clears_draft(self):
         self.at.session_state["_reader_edit_unlocked"] = True
         self.at.run()
-        self.at.text_area(key="_reader_edit_area").set_value("edited body\n")
+        self.at.text_area(key=self._raw_key(self.at)).set_value("edited body\n")
         self.at.run()
         self.at.button(key="_reader_edit_save_btn").click()
         self.at.run()
@@ -309,21 +344,23 @@ class LockDefaultAppTests(_HostAppTest):
     def test_revert_discards_draft_and_keeps_file(self):
         self.at.session_state["_reader_edit_unlocked"] = True
         self.at.run()
-        self.at.text_area(key="_reader_edit_area").set_value("junk\n")
+        self.at.text_area(key=self._raw_key(self.at)).set_value("junk\n")
         self.at.run()
         self.at.button(key="_reader_edit_revert_btn").click()
         self.at.run()
         self.assertFalse(self.at.exception)
         with open(self.notes) as f:
             self.assertEqual(f.read(), "on disk\n")
+        # The revert rotates the raw textarea's key; the fresh textarea is
+        # seeded from disk, not from the discarded draft.
         self.assertEqual(
-            self.at.text_area(key="_reader_edit_area").value, "on disk\n"
+            self.at.text_area(key=self._raw_key(self.at)).value, "on disk\n"
         )
 
     def test_dirty_close_is_blocked(self):
         self.at.session_state["_reader_edit_unlocked"] = True
         self.at.run()
-        self.at.text_area(key="_reader_edit_area").set_value("dirty edit\n")
+        self.at.text_area(key=self._raw_key(self.at)).set_value("dirty edit\n")
         self.at.run()
         self.at.button(key="_reader_close_doc_btn").click()
         self.at.run()
@@ -337,7 +374,7 @@ class LockDefaultAppTests(_HostAppTest):
         with open(self.notes, "w") as f:
             f.write("changed outside\n")
         os.utime(self.notes, (os.path.getmtime(self.notes) + 5,) * 2)
-        self.at.text_area(key="_reader_edit_area").set_value("my draft\n")
+        self.at.text_area(key=self._raw_key(self.at)).set_value("my draft\n")
         self.at.run()
         self.at.button(key="_reader_edit_save_btn").click()
         self.at.run()
@@ -374,14 +411,18 @@ class MultiDocEditAppTests(_HostAppTest):
         self.assertEqual(self._sget(self.at, "_reader_target"), "b.md")
         self.at.session_state["_reader_edit_unlocked__doc__b.md"] = True
         self.at.run()
-        editor = self._element(self.at, "text_area", "_reader_edit_area__doc__b.md")
+        editor = self._element(
+            self.at, "text_area", self._raw_key(self.at, doc="b.md")
+        )
         self.assertIsNotNone(editor)
         self.assertEqual(editor.value, "bbb\n")
 
     def test_save_writes_only_the_active_document(self):
         self.at.session_state["_reader_edit_unlocked__doc__b.md"] = True
         self.at.run()
-        self.at.text_area(key="_reader_edit_area__doc__b.md").set_value("bee\n")
+        self.at.text_area(
+            key=self._raw_key(self.at, doc="b.md")
+        ).set_value("bee\n")
         self.at.run()
         self.at.button(key="_reader_edit_save_btn").click()
         self.at.run()
@@ -390,6 +431,206 @@ class MultiDocEditAppTests(_HostAppTest):
             self.assertEqual(f.read(), "bee\n")
         with open(os.path.join(self.tmp, "a.md")) as f:
             self.assertEqual(f.read(), "aaa\n")
+
+
+class MdBlocksTests(unittest.TestCase):
+    """The block splitter behind the in-place editor."""
+
+    def test_top_level_blocks_span_whole_constructs(self):
+        src = (
+            "# T\n"
+            "\n"
+            "para one.\n"
+            "\n"
+            "- a\n"
+            "- b\n"
+            "\n"
+            "| h |\n"
+            "|---|\n"
+            "| 1 |\n"
+            "\n"
+            "```py\n"
+            "# not a heading\n"
+            "```\n"
+            "\n"
+            "tail\n"
+        )
+        blocks, refs = reader._md_blocks(src)
+        self.assertEqual(
+            [b[2] for b in blocks],
+            [
+                "# T\n",
+                "para one.\n",
+                "- a\n- b\n\n",  # lists absorb their trailing blank line
+                "| h |\n|---|\n| 1 |\n",
+                "```py\n# not a heading\n```\n",
+                "tail\n",
+            ],
+        )
+        self.assertEqual(refs, "")
+
+    def test_reference_definitions_come_back_as_source(self):
+        src = "para [r][1].\n\n[1]: https://x\n\ntail\n"
+        blocks, refs = reader._md_blocks(src)
+        self.assertEqual([b[2] for b in blocks], ["para [r][1].\n", "tail\n"])
+        self.assertEqual(refs, "[1]: https://x\n")
+
+    def test_empty_text_has_no_blocks(self):
+        self.assertEqual(reader._md_blocks(""), ([], ""))
+
+
+class BlockEditAppTests(_HostAppTest):
+    """The unlocked .md view: rendered blocks with in-place ✎ editors.
+
+    Clicking a handle swaps just that block for a source editor; committing
+    splices the block's lines back into the draft (never the disk — 💾 Save
+    does that), and everything else stays rendered.
+    """
+
+    BODY = (
+        "# Title\n"
+        "\n"
+        "First paragraph.\n"
+        "\n"
+        "## Section\n"
+        "\n"
+        "- a\n"
+        "- b\n"
+        "\n"
+        "Last paragraph.\n"
+    )
+
+    def setUp(self):
+        self.tmp, self.notes, self.host = self._make_host(
+            {"notes.md": self.BODY}
+        )
+        self.at = AppTest.from_file(self.host)
+        self.at.run()
+        self.at.session_state["_reader_edit_unlocked"] = True
+        self.at.run()
+
+    def test_unlock_renders_blocks_with_handles(self):
+        self.assertFalse(self.at.exception)
+        # The document renders as separate blocks (each with its own handle),
+        # not one whole-document markdown blob.
+        self.assertIsNotNone(
+            self._element(self.at, "button", "_reader_blk_btn_0")
+        )
+        self.assertIsNotNone(
+            self._element(self.at, "button", "_reader_blk_btn_1")
+        )
+        rendered = [
+            m.value for m in self.at.markdown if m.value
+            and "<style>" not in m.value
+        ]
+        self.assertTrue(
+            any(v.strip() == "First paragraph." for v in rendered)
+        )
+
+    def test_handle_opens_in_place_editor_for_that_block(self):
+        self.at.button(key="_reader_blk_btn_1").click()
+        self.at.run()
+        area = self._element(self.at, "text_area", "_reader_edit_block_area")
+        self.assertIsNotNone(area)
+        self.assertEqual(area.value, "First paragraph.\n")
+
+    def test_commit_splices_draft_closes_editor_keeps_disk(self):
+        self.at.button(key="_reader_blk_btn_1").click()
+        self.at.run()
+        self.at.text_area(key="_reader_edit_block_area").set_value(
+            "Rewritten!\n"
+        )
+        self.at.run()
+        self.assertFalse(self.at.exception)
+        self.assertEqual(
+            self._sget(self.at, "_reader_edit_draft"),
+            self.BODY.replace("First paragraph.\n", "Rewritten!\n"),
+        )
+        with open(self.notes) as f:
+            self.assertEqual(f.read(), self.BODY)
+        # The editor closed: no block textarea is mounted any more.
+        with self.assertRaises(KeyError):
+            self.at.text_area(key="_reader_edit_block_area")
+
+    def test_list_replacement_regains_its_blank_separator(self):
+        # A list block absorbs the blank line after it; replacing the list
+        # without retyping that blank must not fuse it into the next block.
+        self.at.button(key="_reader_blk_btn_3").click()  # the "- a / - b" list
+        self.at.run()
+        self.at.text_area(key="_reader_edit_block_area").set_value("- x\n- y\n")
+        self.at.run()
+        self.assertFalse(self.at.exception)
+        self.assertEqual(
+            self._sget(self.at, "_reader_edit_draft"),
+            self.BODY.replace("- a\n- b\n", "- x\n- y\n"),
+        )
+
+    def test_commit_then_save_writes_disk_and_clears_draft(self):
+        self.at.button(key="_reader_blk_btn_1").click()
+        self.at.run()
+        self.at.text_area(key="_reader_edit_block_area").set_value(
+            "Rewritten!\n"
+        )
+        self.at.run()
+        self.at.button(key="_reader_edit_save_btn").click()
+        self.at.run()
+        self.assertFalse(self.at.exception)
+        with open(self.notes) as f:
+            self.assertEqual(
+                f.read(), self.BODY.replace("First paragraph.\n", "Rewritten!\n")
+            )
+        self.assertIsNone(self._sget(self.at, "_reader_edit_draft"))
+
+    def test_cancel_closes_without_splicing(self):
+        self.at.button(key="_reader_blk_btn_1").click()
+        self.at.run()
+        self.at.button(key="_reader_blk_cancel_btn").click()
+        self.at.run()
+        self.assertFalse(self.at.exception)
+        self.assertIsNone(self._sget(self.at, "_reader_edit_draft"))
+        with self.assertRaises(KeyError):
+            self.at.text_area(key="_reader_edit_block_area")
+
+    def test_block_edit_is_blocked_by_the_dirty_close_guard(self):
+        self.at.button(key="_reader_blk_btn_1").click()
+        self.at.run()
+        self.at.text_area(key="_reader_edit_block_area").set_value(
+            "Rewritten!\n"
+        )
+        self.at.run()
+        self.at.button(key="_reader_close_doc_btn").click()
+        self.at.run()
+        # The dialog intercepted: the document is still open.
+        self.assertEqual(self._sget(self.at, "_reader_target"), "notes.md")
+
+    def test_block_commit_reseeds_the_raw_expander(self):
+        # The raw-source expander must never hold a stale pre-splice copy:
+        # after a block commit its textarea REMOUNTS (key rotation) seeded
+        # from the updated draft.
+        self.at.button(key="_reader_blk_btn_1").click()
+        self.at.run()
+        self.at.text_area(key="_reader_edit_block_area").set_value(
+            "Rewritten!\n"
+        )
+        self.at.run()
+        self.assertEqual(
+            self.at.text_area(key=self._raw_key(self.at)).value,
+            self.BODY.replace("First paragraph.\n", "Rewritten!\n"),
+        )
+
+    def test_raw_commit_closes_the_block_editor(self):
+        self.at.button(key="_reader_blk_btn_1").click()
+        self.at.run()
+        self.at.text_area(key=self._raw_key(self.at)).set_value(
+            "whole new doc\n"
+        )
+        self.at.run()
+        self.assertFalse(self.at.exception)
+        self.assertEqual(
+            self._sget(self.at, "_reader_edit_draft"), "whole new doc\n"
+        )
+        with self.assertRaises(KeyError):
+            self.at.text_area(key="_reader_edit_block_area")
 
 
 if __name__ == "__main__":
