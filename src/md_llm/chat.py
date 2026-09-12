@@ -480,10 +480,11 @@ def _build_stream(context_path, holder):
     model = _current_llm_model(prefix=p)
     instruction = st.session_state.get(f"{p}llm_instruction") or None
 
-    # Cline may legitimately run with no model: an empty selection means "use
-    # whatever `cline auth` configured", so the blanket model check below is
-    # skipped for it.
-    if not model and provider != "Cline":
+    # Cline and ZCode may legitimately run with no model: Cline's empty
+    # selection means "use whatever `cline auth` configured", and ZCode's
+    # headless CLI has no --model flag at all (model routing is ZCode's own
+    # config) — so the blanket model check below is skipped for both.
+    if not model and provider not in ("Cline", "ZCode"):
         return None, "Pick or type an LLM model first (in the LLM controls)."
 
     turns = _send_context_and_turns(context_path)
@@ -579,6 +580,22 @@ def _build_stream(context_path, holder):
         gen = llm.cline_chat_stream(
             prompt, model=model or None, workdir=workdir, thinking=thinking,
             hardened=hardened, instruction=instruction,
+        )
+    elif provider == "ZCode":
+        workdir = sandbox.normalize_workdir(
+            st.session_state.get(f"{p}llm_zcode_workdir")
+        )
+        hardened = bool(st.session_state.get(f"{p}llm_zcode_hardened", True))
+        if workdir is None:
+            # Managed mode: this session's own fresh sandbox (Seatbelt-confined
+            # when hardened), never the shared uploads folder. Shared with the
+            # OpenCode and Cline providers, so switching agents keeps the
+            # session files.
+            workdir = _session_sandbox_dir()
+        prompt = _turns_to_opencode_prompt(turns)
+        gen = llm.zcode_chat_stream(
+            prompt, workdir=workdir, hardened=hardened,
+            instruction=instruction,
         )
     else:
         endpoint = st.session_state.get(

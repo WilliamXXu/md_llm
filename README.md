@@ -3,7 +3,7 @@
 A reusable Streamlit component package: a **markdown reader** + **LLM chat**
 panel for any markdown/text files. Plugs into any Streamlit host app.
 
-Five LLM providers (stdlib-only clients, no SDK), grouped in the panel by
+Six LLM providers (stdlib-only clients, no SDK), grouped in the panel by
 kind — **Agent CLIs** (subprocess agents with out-of-band auth, working
 directory, and sandbox options) vs **API providers** (plain chat-completions
 endpoints):
@@ -33,6 +33,15 @@ endpoints):
   (note: a model handed to cline persists as its new default). Both agent
   providers run in the same per-chat-session sandbox — a fresh directory per
   session, Seatbelt-confined on macOS when **Hardened sandbox** is on.
+- **ZCode** — the Z.ai / BigModel coding **agent** CLI, invoked headless via
+  `zcode --prompt=... --json` (one final JSON result object — the reply
+  arrives as a single chunk when the turn completes). Auth is ZCode's own
+  (`zcode login`); the headless CLI has no `--model` flag — the Model
+  dropdown lists every ref declared in ZCode's config
+  (`~/.zcode/cli/config.json`) and a pick rewrites it, the same thing
+  `/model` does in a zcode session, so the switch is **global** (ZCode app
+  and other CLI sessions pick it up too). All three agent providers share
+  the same per-chat-session sandbox.
 
 ## Install
 

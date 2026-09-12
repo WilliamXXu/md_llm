@@ -24,6 +24,7 @@ import os
 import json
 import re
 import subprocess
+import tempfile
 import threading
 import urllib.error
 import urllib.parse
@@ -1461,3 +1462,295 @@ def cline_chat_stream(
                 or f"exited {proc.returncode}"
             )
         raise RuntimeError(f"cline error: {err_msg}")
+
+
+# --- ZCode (coding agent CLI, one-shot subprocess path) ----------------------
+#
+# `zcode --prompt "..." --json` runs one headless agent turn and prints a
+# single pretty-printed JSON object on stdout (multi-line, NOT NDJSON):
+#   { "response": "...", "sessionId": "sess_...", "usage": {...}, ... }
+# Status/progress goes to stderr; the reply text arrives only in the final
+# object, so unlike OpenCode/Cline there is no event stream to follow and the
+# text is yielded as one chunk when the run ends. Failures surface as a
+# non-zero exit with (colourized) diagnostics on stderr. As with Cline, model
+# routing is out-of-band: the CLI reads its model from its own config
+# (~/.zcode/cli/config.json) and has no --model flag — switch that config via
+# set_zcode_model (the TUI /model equivalent).
+
+ZCODE_BIN = "zcode"
+ZCODE_CONFIG_PATH = os.path.join(
+    os.path.expanduser("~"), ".zcode", "cli", "config.json"
+)
+
+
+def read_zcode_config(path=ZCODE_CONFIG_PATH):
+    """Return ZCode's parsed CLI config ({} when missing or invalid JSON).
+
+    The config is ZCode's own (`~/.zcode/cli/config.json`); it holds the
+    provider definitions (auth incl. base URLs and API keys) and the
+    currently selected model.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def list_zcode_model_refs(path=ZCODE_CONFIG_PATH):
+    """Return every model ref declared in ZCode's config, sorted.
+
+    Refs are ``providerId/modelId`` (e.g.
+    ``builtin:bigmodel-coding-plan/GLM-5.3``) — the same shape the config's
+    ``model`` key and the TUI's /model picker use. Providers with no models
+    (or a malformed config) contribute nothing; [] means discovery is
+    unavailable (config missing/invalid) and the UI falls back to the
+    currently-configured ref only.
+    """
+    providers = read_zcode_config(path).get("provider")
+    if not isinstance(providers, dict):
+        return []
+    refs = []
+    for provider_id, provider in providers.items():
+        if not isinstance(provider_id, str) or not isinstance(provider, dict):
+            continue
+        models = provider.get("models")
+        if not isinstance(models, dict):
+            continue
+        refs.extend(
+            f"{provider_id}/{model_id}"
+            for model_id in models
+            if isinstance(model_id, str) and model_id
+        )
+    return sorted(refs)
+
+
+def read_zcode_model(path=ZCODE_CONFIG_PATH):
+    """Return ZCode's currently configured model ref ('' when unset).
+
+    Accepts both persisted shapes: the plain string form the TUI writes
+    (``"providerId/modelId"``) and the object form from ZCode's example
+    config (``{"main": "providerId/modelId", "lite": ...}``), where ``main``
+    is the model used for prompts.
+    """
+    model = read_zcode_config(path).get("model")
+    if isinstance(model, str):
+        return model.strip()
+    if isinstance(model, dict):
+        main = model.get("main")
+        if isinstance(main, str):
+            return main.strip()
+    return ""
+
+
+def _read_json_object(path, what):
+    """Read a strict-JSON object file; RuntimeError (file untouched) otherwise.
+
+    ``what`` names the file in error messages (e.g. "the zcode config").
+    Strict means: no JSONC — a config carrying comments fails to parse and
+    the caller must refuse to rewrite it rather than destroy the comments.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise RuntimeError(f"Could not read {what} {path!r}: {e}") from e
+    if not isinstance(cfg, dict):
+        raise RuntimeError(f"Could not read {what} {path!r}: not a JSON object")
+    return cfg
+
+
+def _write_json_atomic(path, cfg, what):
+    """Write ``cfg`` to ``path`` atomically (temp file + os.replace).
+
+    Preserves the previous file's permission bits and leaves no temp file on
+    any in-process failure. Raises RuntimeError on OSError so the UI can
+    surface it via ``st.error``.
+    """
+    try:
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".", prefix=".llm-config-"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+                f.write("\n")
+            try:
+                os.chmod(tmp, os.stat(path).st_mode & 0o777)
+            except OSError:
+                pass  # mkstemp's 0600 is a fine fallback
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        raise RuntimeError(f"Could not write {what} {path!r}: {e}") from e
+
+
+def set_zcode_model(ref, path=ZCODE_CONFIG_PATH):
+    """Persist ``ref`` as ZCode's configured model (atomic replace).
+
+    This is the same persistence the TUI's /model command performs: the
+    ``model`` key of ZCode's own config is rewritten and everything else in
+    the file is preserved key-for-key. **The switch is global** — it takes
+    effect for the ZCode desktop app, TUI sessions and headless runs alike.
+
+    Raises :class:`ValueError` on an empty ref and :class:`RuntimeError` on
+    an unreadable or unwritable config so the UI can surface it via
+    ``st.error``.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        raise ValueError("No model ref for zcode config switch.")
+    what = "the zcode config"
+    cfg = _read_json_object(path, what)
+    cfg["model"] = ref
+    _write_json_atomic(path, cfg, what)
+
+
+def zcode_chat_stream(
+    prompt,
+    *,
+    workdir=None,
+    binary=ZCODE_BIN,
+    instruction=None,
+    hardened=False,
+    timeout=REQUEST_TIMEOUT,
+):
+    """Run ``zcode --prompt=<text> --json`` and yield the assistant reply.
+
+    ZCode is a coding AGENT, not a plain chat API: a headless ``--prompt`` run
+    (permission mode defaults to yolo) may run bash/read/edit/etc. in
+    ``workdir`` (``--cwd``). The prompt is passed in ``--prompt=<text>`` form
+    (the CLI rejects a separate ``--prompt "-text"`` argument as ambiguous).
+    Stdout carries ONE pretty-printed JSON result object; its ``response``
+    field is yielded as a single chunk when the run completes (there is no
+    event stream to follow mid-turn). Model routing is ZCode's own config
+    (``~/.zcode/cli/config.json`` — switch it beforehand with
+    :func:`set_zcode_model`, the TUI /model equivalent); the CLI has no
+    ``--model`` flag. A non-zero exit, unparseable stdout, or a result without
+    a ``response`` raises :class:`RuntimeError` — preferring stderr's
+    (ANSI-stripped) tail. If ``instruction`` is given it is prepended to the
+    prompt.
+
+    With ``hardened=True`` (macOS) the subprocess runs under a generated
+    Seatbelt profile (:mod:`md_llm.sandbox`): file writes are confined to the
+    workdir + scratch space (+ ZCode's own ``~/.zcode`` runtime tree), reads
+    of the host's data tree and credential stores are denied, network stays
+    open for the model API.
+
+    Auth + quota are ZCode's own (configure via ``zcode login``). Note each
+    turn re-pays ZCode's full agent system prompt (~13k input tokens on
+    runtime 0.16.x) even for tiny replies. Very large prompts may hit the OS
+    argv length limit.
+
+    Raises :class:`RuntimeError` with a clear message on a missing binary /
+    agent failure so the UI can surface it via ``st.error``.
+    """
+    if not prompt:
+        raise ValueError("No prompt for zcode run.")
+
+    full_prompt = prompt
+    if instruction:
+        full_prompt = f"{instruction}\n\n{prompt}"
+
+    args = [binary, f"--prompt={full_prompt}", "--json"]
+    if workdir:
+        args += ["--cwd", workdir]
+
+    # zcode's --cwd chdirs, so the directory must already exist. Create it
+    # (best-effort) — this also gives a fresh sandbox a place to land.
+    if workdir:
+        try:
+            os.makedirs(workdir, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(
+                f"Could not create zcode working directory {workdir!r}: {e}"
+            ) from e
+
+    # Wrap in a macOS Seatbelt profile when hardened mode is requested and the
+    # host can enforce it; elsewhere (or without sandbox-exec) run unconfined.
+    profile_path = None
+    if hardened and sandbox.seatbelt_available():
+        try:
+            profile_path = sandbox.write_seatbelt_profile(workdir or ".")
+            args = ["sandbox-exec", "-f", profile_path] + args
+        except OSError:
+            profile_path = None  # degrade to unconfined rather than fail
+
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=-1,  # one pretty-printed JSON object, not NDJSON
+        )
+    except FileNotFoundError as e:
+        if profile_path:
+            _unlink_quietly(profile_path)
+        raise RuntimeError(
+            f"Could not find the {binary!r} executable on PATH. Install "
+            "zcode (see https://zcode.z.ai) to use this provider."
+        ) from e
+    except OSError as e:
+        if profile_path:
+            _unlink_quietly(profile_path)
+        raise RuntimeError(f"Could not start zcode: {e}") from e
+
+    # Drain stderr on a background thread so a chatty agent can't fill the OS
+    # pipe buffer (64 KiB) and deadlock the stdout reader.
+    stderr_lines: list[str] = []
+
+    def _drain_stderr():
+        if proc.stderr is not None:
+            for ln in proc.stderr:
+                stderr_lines.append(ln)
+
+    drainer = threading.Thread(target=_drain_stderr, daemon=True)
+    drainer.start()
+
+    stdout_text = ""
+    try:
+        assert proc.stdout is not None
+        stdout_text = proc.stdout.read()
+        proc.wait(timeout=timeout)
+    finally:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        drainer.join(timeout=5)
+        if profile_path:
+            _unlink_quietly(profile_path)
+
+    def _fail(msg):
+        tail = _ANSI_ESCAPE_RE.sub("", "".join(stderr_lines)).strip()
+        raise RuntimeError(
+            f"zcode error: {msg}" + (f": {tail[-500:]}" if tail else "")
+        )
+
+    if proc.returncode not in (0, None):
+        _fail(f"exited {proc.returncode}")
+
+    # Tolerate noise around the JSON object: raw_decode parses the first
+    # complete object found at/after the first brace and ignores anything
+    # trailing.
+    start = stdout_text.find("{")
+    result = None
+    if start != -1:
+        try:
+            result, _ = json.JSONDecoder().raw_decode(stdout_text, start)
+        except json.JSONDecodeError:
+            result = None
+    if not isinstance(result, dict):
+        _fail("did not print a JSON result object")
+    response = result.get("response")
+    if not isinstance(response, str) or not response:
+        _fail("result carried no response")
+
+    yield response

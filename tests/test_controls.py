@@ -104,14 +104,14 @@ class ProviderKindSeparationTests(unittest.TestCase):
 
     def test_the_groups_partition_the_providers(self):
         # The mirror and the kind radios rely on the split being a partition
-        # of exactly the five supported providers.
+        # of exactly the six supported providers.
         self.assertFalse(
             set(controls.AGENT_PROVIDERS) & set(controls.API_PROVIDERS)
         )
         self.assertEqual(
             sorted(controls.AGENT_PROVIDERS + controls.API_PROVIDERS),
             ["Cline", "Ollama", "OpenAI-compatible", "OpenCode",
-             "OpenRouter"],
+             "OpenRouter", "ZCode"],
         )
 
 

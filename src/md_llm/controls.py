@@ -36,6 +36,16 @@ NiceGUI line):
     (fetched once per session, Refresh to re-fetch) on top of remembered
     history, with an "(default)" option that uses Cline's own configured
     model.
+  - **ZCode**: the Z.ai / BigModel coding AGENT CLI, invoked headless as a
+    subprocess (``zcode --prompt=... --json``) — one final JSON result
+    object, so the reply arrives as a single chunk when the turn completes.
+    No API key (auth is out-of-band via ``zcode login``). The headless CLI
+    has no ``--model`` flag — it reads its model from ZCode's own config
+    (``~/.zcode/cli/config.json``), which the Model dropdown reads (every
+    declared ``providerId/modelId`` ref) and rewrites on a pick — the same
+    persistence the TUI's ``/model`` uses; GLOBAL — the ZCode app and other
+    CLI sessions pick it up too. Plus the shared working-directory and
+    Seatbelt sandbox options.
 
 The controls are prefix-namespaced (``prefix`` arg) so several panels can each
 keep independent values without their Streamlit widget keys colliding — the chat
@@ -64,7 +74,7 @@ from .core import get_core
 # selected provider is mirrored into the flat ``{p}llm_provider`` key every
 # consumer reads (chat.py, _current_llm_model, …), so the split is purely a
 # UI concern.
-AGENT_PROVIDERS = ["OpenCode", "Cline"]
+AGENT_PROVIDERS = ["OpenCode", "Cline", "ZCode"]
 API_PROVIDERS = ["OpenRouter", "Ollama", "OpenAI-compatible"]
 
 # The flat key's pre-separation default, kept as the fresh-session default so
@@ -145,6 +155,11 @@ def _current_llm_model(prefix=""):
         if sel and sel not in ("(other — type below)", CLINE_DEFAULT_MODEL_LABEL):
             return sel.strip()
         return st.session_state.get(f"{p}llm_cline_model", "").strip()
+    if provider == "ZCode":
+        # Display-only: ZCode's headless CLI reads its own configured model;
+        # switching happens in the ZCode controls (a global config write, like
+        # the TUI's /model).
+        return llm.read_zcode_model()
     sel = st.session_state.get(f"{p}llm_model_sel")
     if sel == "(other — type below)":
         return st.session_state.get(f"{p}llm_model_custom", "").strip()
@@ -872,6 +887,142 @@ def _render_cline_controls(prefix, saved_llm):
     )
 
 
+# --- ZCode (coding agent CLI, one-shot subprocess path) ----------------------
+
+# Select option meaning "leave ZCode's configured model untouched". ZCode
+# reads its model from its own config (~/.zcode/cli/config.json), so there is
+# no per-run model to hand the CLI — this option is the explicit no-op.
+ZCODE_CURRENT_MODEL_LABEL = "(ZCode's configured model)"
+
+# Session key of ZCode's per-session model-ref cache (see
+# :func:`_zcode_cached_model_refs`). Lives outside the chat panel's
+# prefix-namespaced keys — the refs are global to ZCode's config, not per
+# panel.
+_ZCODE_MODEL_REFS_CACHE_KEY = "_zcode_model_refs_cache"
+
+
+def _zcode_cached_model_refs():
+    """Return ZCode's declared model refs, memoized in the session state.
+
+    Discovery is a local config read (``~/.zcode/cli/config.json``), so the
+    memo only avoids re-parsing per rerun; the Refresh button drops it so an
+    out-of-band config change (``zcode login`` adding a provider) can be
+    picked up. [] means the config is missing/invalid — the dropdown degrades
+    to the currently-configured ref only.
+    """
+    cache = st.session_state.get(_ZCODE_MODEL_REFS_CACHE_KEY)
+    if cache is None:
+        cache = llm.list_zcode_model_refs()
+        st.session_state[_ZCODE_MODEL_REFS_CACHE_KEY] = cache
+    return list(cache)
+
+
+def _render_zcode_controls(prefix, saved_llm):
+    """Render the ZCode provider's model / sandbox controls.
+
+    The Model dropdown lists every ref declared in ZCode's own config plus
+    the currently configured one; picking a ref rewrites that config (the
+    same persistence the TUI's /model performs) — a GLOBAL switch, also
+    effective in the ZCode desktop app and other CLI sessions. Keeping
+    "(ZCode's configured model)" selected leaves it untouched. By default the
+    agent runs in a hardened per-chat sandbox — the SAME per-session
+    directory the OpenCode and Cline providers use, so switching providers
+    mid-session keeps the sandbox contents.
+    """
+    p = prefix
+    current = llm.read_zcode_model()
+    discovered = _zcode_cached_model_refs()
+    options = [ZCODE_CURRENT_MODEL_LABEL] + list(discovered)
+    if current and current not in options:
+        options.append(current)
+    sel = st.session_state.get(f"{p}llm_zcode_model_sel")
+    if sel not in options:
+        # Fresh mount or a stale selection (the config changed out-of-band):
+        # a concrete selection that differs from the freshly-read config is
+        # stale by construction, so fall back to the configured ref.
+        st.session_state[f"{p}llm_zcode_model_sel"] = current or (
+            ZCODE_CURRENT_MODEL_LABEL
+        )
+
+    mcol, rcol = st.columns([4, 1])
+    mcol.selectbox(
+        "Model (switches ZCode globally)",
+        options,
+        key=f"{p}llm_zcode_model_sel",
+        help=(
+            "Every model declared in ZCode's own config "
+            "(~/.zcode/cli/config.json), plus the currently configured one. "
+            "Picking a ref rewrites that config — the same thing `/model` "
+            "does in a zcode session — so the switch is GLOBAL: it also "
+            "applies to the ZCode desktop app and any other zcode sessions. "
+            "Keep \"(ZCode's configured model)\" selected to leave it alone."
+        ),
+    )
+    if rcol.button("Refresh", key=f"_zcode_refresh{p.rstrip('_')}"):
+        st.session_state.pop(_ZCODE_MODEL_REFS_CACHE_KEY, None)
+        st.rerun()
+
+    # Apply the pick: rewrite ZCode's config (global). Runs on the rerun the
+    # pick triggers; a concrete selection equal to the configured ref is a
+    # no-op, and a failed write resets the dropdown to the real config.
+    picked = st.session_state.get(f"{p}llm_zcode_model_sel")
+    if (
+        picked
+        and picked not in (ZCODE_CURRENT_MODEL_LABEL, current)
+    ):
+        try:
+            llm.set_zcode_model(picked)
+            st.toast(f"ZCode model switched globally: {picked}", icon="✅")
+        except (ValueError, RuntimeError) as e:
+            st.error(f"Could not switch the ZCode model: {e}")
+            st.session_state[f"{p}llm_zcode_model_sel"] = current or (
+                ZCODE_CURRENT_MODEL_LABEL
+            )
+
+    st.checkbox(
+        "Hardened sandbox (Seatbelt)",
+        value=saved_llm.get(f"{p}llm_zcode_hardened", True),
+        key=f"{p}llm_zcode_hardened",
+        help=(
+            "Run the agent under a macOS Seatbelt profile: writes are "
+            "confined to the working directory plus scratch space (and "
+            "ZCode's own ~/.zcode runtime tree); reads of this app's data "
+            "folder (uploads, chats, settings) and of credential stores "
+            "(~/.ssh, ~/.gnupg, ...) are blocked. Network stays open for "
+            "the model API."
+        ),
+    )
+    st.text_input(
+        "Working directory (optional override)",
+        value=saved_llm.get(f"{p}llm_zcode_workdir", ""),
+        key=f"{p}llm_zcode_workdir",
+        placeholder="fresh per-chat sandbox (recommended)",
+        help=(
+            "Leave empty to give each chat session its own fresh sandbox "
+            "directory — cleared before use, garbage-collected after. Enter "
+            "a path to pin a real project directory instead; it is never "
+            "wiped automatically. Shared with the OpenCode and Cline "
+            "providers' sandbox."
+        ),
+    )
+    if st.button(
+        "Clear this chat's sandbox", key=f"_zcode_clear_sandbox{p.rstrip('_')}"
+    ):
+        doc = docs.active_document()
+        sb_key = docs.chat_key("_opencode_sandbox", docs.active_chat(doc), doc)
+        path = st.session_state.pop(sb_key, None)
+        if path and sandbox.clear_sandbox(path):
+            st.toast("Sandbox directory deleted.", icon="🧹")
+        else:
+            st.caption("No active sandbox yet — it is created on first send.")
+    st.caption(
+        "_ZCode runs one headless `--prompt` turn (tools auto-approved). "
+        "Authenticate out-of-band via `zcode login`. Replies arrive as a "
+        "single chunk when the turn completes: ZCode's --json output is one "
+        "final result object, not an event stream._"
+    )
+
+
 # --- control widgets --------------------------------------------------------
 
 def _on_oai_endpoint_change(prefix):
@@ -1064,6 +1215,8 @@ def _render_llm_controls(prefix="", show_instruction=True):
         _render_opencode_controls(prefix, saved_llm)
     elif provider == "Cline":
         _render_cline_controls(prefix, saved_llm)
+    elif provider == "ZCode":
+        _render_zcode_controls(prefix, saved_llm)
     else:
         st.text_input(
             "OpenRouter endpoint",
