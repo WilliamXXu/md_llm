@@ -7,7 +7,9 @@ worker, autopilot, LLM-output grid). Every persistence call goes through the
 injected Core (:func:`md_llm.core.get_core`) instead of a host ``tl`` module, so
 this module is host-agnostic.
 
-Five providers, toggled by a radio:
+Two provider KINDS, picked by the "Provider type" radio, then a provider
+within the kind (the agent/API separation, ported back from the archived
+NiceGUI line):
   - **Ollama**: a local server; models auto-discovered via /api/tags.
   - **OpenRouter**: a hosted API; API key defaults to OPENROUTER_API_KEY.
     The Model dropdown auto-populates with the catalog's current free models
@@ -50,6 +52,49 @@ from . import docs
 from . import llm
 from . import sandbox
 from .core import get_core
+
+
+# --- provider kinds (the agent/API separation) -------------------------------
+#
+# Two deliberately separated groups (ported back from the archived NiceGUI
+# line): agent CLIs run as local subprocesses with their own out-of-band auth,
+# working directory, and sandbox options, while API providers are plain
+# chat-completions endpoints (endpoint + model + API key). The UI picks a kind
+# first ("Agent CLIs" / "API providers"), then a provider within it; the
+# selected provider is mirrored into the flat ``{p}llm_provider`` key every
+# consumer reads (chat.py, _current_llm_model, …), so the split is purely a
+# UI concern.
+AGENT_PROVIDERS = ["OpenCode", "Cline"]
+API_PROVIDERS = ["OpenRouter", "Ollama", "OpenAI-compatible"]
+
+# The flat key's pre-separation default, kept as the fresh-session default so
+# the grouping changes no behavior beyond the UI.
+DEFAULT_PROVIDER = "OpenRouter"
+
+_KIND_LABELS = {"agents": "Agent CLIs", "api": "API providers"}
+
+
+def _seed_provider_kind(prefix=""):
+    """One-time migration: derive the kind + group keys from a legacy value.
+
+    Sessions from before the separation hold a flat ``{p}llm_provider`` widget
+    value (or nothing — then the default applies). Seed ``{p}llm_kind`` plus
+    the matching group key from it so the new radios open on the provider the
+    session was already using. No-op once ``{p}llm_kind`` exists.
+    """
+    p = prefix
+    if f"{p}llm_kind" in st.session_state:
+        return
+    legacy = st.session_state.get(f"{p}llm_provider", DEFAULT_PROVIDER)
+    if legacy in AGENT_PROVIDERS:
+        st.session_state[f"{p}llm_kind"] = "agents"
+        st.session_state.setdefault(f"{p}llm_agent_provider", legacy)
+    else:
+        st.session_state[f"{p}llm_kind"] = "api"
+        st.session_state.setdefault(
+            f"{p}llm_api_provider",
+            legacy if legacy in API_PROVIDERS else API_PROVIDERS[0],
+        )
 
 
 # --- helpers: read the active provider/model -------------------------------
@@ -971,12 +1016,31 @@ def _render_llm_controls(prefix="", show_instruction=True):
     """
     p = prefix
     saved_llm = get_core().load_settings().get("llm") or {}
+    _seed_provider_kind(p)
+    kind = st.radio(
+        "Provider type",
+        list(_KIND_LABELS),
+        format_func=_KIND_LABELS.get,
+        horizontal=True,
+        key=f"{p}llm_kind",
+    )
+    if kind == "agents":
+        group, sub_key = AGENT_PROVIDERS, f"{p}llm_agent_provider"
+    else:
+        group, sub_key = API_PROVIDERS, f"{p}llm_api_provider"
+    # Each kind owns its own widget key, so switching kinds never resets the
+    # other kind's remembered provider — flip-flopping preserves both.
+    if st.session_state.get(sub_key) not in group:
+        st.session_state[sub_key] = group[0]
     provider = st.radio(
         "Provider",
-        ["OpenCode", "Cline", "OpenRouter", "Ollama", "OpenAI-compatible"],
+        group,
         horizontal=True,
-        key=f"{p}llm_provider",
+        key=sub_key,
     )
+    # The single source of truth every consumer reads — a plain (non-widget)
+    # key, refreshed on every render before anything reads it.
+    st.session_state[f"{p}llm_provider"] = provider
 
     if provider == "Ollama":
         st.text_input(

@@ -3,7 +3,10 @@
 A reusable Streamlit component package: a **markdown reader** + **LLM chat**
 panel for any markdown/text files. Plugs into any Streamlit host app.
 
-Five LLM providers (stdlib-only clients, no SDK):
+Five LLM providers (stdlib-only clients, no SDK), grouped in the panel by
+kind — **Agent CLIs** (subprocess agents with out-of-band auth, working
+directory, and sandbox options) vs **API providers** (plain chat-completions
+endpoints):
 
 - **Ollama** — local server (optional `autossh` tunnel to a remote box).
 - **OpenRouter** — hosted API keyed by `OPENROUTER_API_KEY`. The Model

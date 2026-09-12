@@ -42,6 +42,79 @@ def _make_core(store=None):
     return c
 
 
+class ProviderKindSeparationTests(unittest.TestCase):
+    """The agent/API provider split: kind seeding from legacy flat values.
+
+    The UI renders a "Provider type" radio (Agent CLIs / API providers), then
+    a provider radio within the group, and mirrors the selection into the
+    flat ``{p}llm_provider`` key. These cover the migration helper that keeps
+    pre-separation sessions on their provider; the mirror itself is one
+    assignment inside _render_llm_controls.
+    """
+
+    KEYS = (
+        "chat_llm_kind", "chat_llm_agent_provider",
+        "chat_llm_api_provider", "chat_llm_provider",
+    )
+
+    def setUp(self):
+        for k in self.KEYS:
+            st.session_state.pop(k, None)
+
+    def tearDown(self):
+        for k in self.KEYS:
+            st.session_state.pop(k, None)
+
+    def test_fresh_session_defaults_to_the_api_group(self):
+        controls._seed_provider_kind("chat_")
+        self.assertEqual(st.session_state["chat_llm_kind"], "api")
+        self.assertEqual(
+            st.session_state["chat_llm_api_provider"], "OpenRouter"
+        )
+
+    def test_legacy_agent_provider_migrates_to_the_agent_group(self):
+        st.session_state["chat_llm_provider"] = "Cline"
+        controls._seed_provider_kind("chat_")
+        self.assertEqual(st.session_state["chat_llm_kind"], "agents")
+        self.assertEqual(
+            st.session_state["chat_llm_agent_provider"], "Cline"
+        )
+
+    def test_legacy_api_provider_migrates_to_the_api_group(self):
+        st.session_state["chat_llm_provider"] = "Ollama"
+        controls._seed_provider_kind("chat_")
+        self.assertEqual(st.session_state["chat_llm_kind"], "api")
+        self.assertEqual(st.session_state["chat_llm_api_provider"], "Ollama")
+
+    def test_existing_kind_is_never_reseeded(self):
+        st.session_state["chat_llm_kind"] = "agents"
+        st.session_state["chat_llm_agent_provider"] = "OpenCode"
+        st.session_state["chat_llm_provider"] = "OpenRouter"  # stale legacy
+        controls._seed_provider_kind("chat_")
+        self.assertEqual(
+            st.session_state["chat_llm_agent_provider"], "OpenCode"
+        )
+
+    def test_seeding_is_prefix_scoped(self):
+        st.session_state["chat_llm_provider"] = "Cline"
+        controls._seed_provider_kind("chat_")
+        controls._seed_provider_kind("")  # bare-prefix panel, fresh session
+        self.assertEqual(st.session_state["chat_llm_kind"], "agents")
+        self.assertEqual(st.session_state["llm_kind"], "api")
+
+    def test_the_groups_partition_the_providers(self):
+        # The mirror and the kind radios rely on the split being a partition
+        # of exactly the five supported providers.
+        self.assertFalse(
+            set(controls.AGENT_PROVIDERS) & set(controls.API_PROVIDERS)
+        )
+        self.assertEqual(
+            sorted(controls.AGENT_PROVIDERS + controls.API_PROVIDERS),
+            ["Cline", "Ollama", "OpenAI-compatible", "OpenCode",
+             "OpenRouter"],
+        )
+
+
 class OaiRegistryReadTests(unittest.TestCase):
     def setUp(self):
         core._reset_for_tests(_make_core())
