@@ -1,4 +1,4 @@
-"""Hard per-run isolation for the agent CLIs (OpenCode, Cline) on macOS Seatbelt.
+"""Hard per-run isolation for the agent CLIs (OpenCode, Cline, ZCode) on macOS Seatbelt.
 
 The chat tab runs ``opencode run --auto`` / ``cline --auto-approve`` as a
 subprocess that may execute bash/edit tools. Left unconfined those tools
@@ -154,7 +154,7 @@ def new_session_sandbox(label, max_age_s=STALE_AFTER_S):
 # --- Seatbelt profile --------------------------------------------------------
 
 _PROFILE_TEMPLATE = """\
-;; md_llm agent sandbox (OpenCode / Cline) — generated, do not edit.
+;; md_llm agent sandbox (OpenCode / Cline / ZCode) — generated, do not edit.
 ;; Last match wins: blanket write deny, then scratch-space allows;
 ;; host-tree/credential read denies, then the agent's own dirs + this
 ;; sandbox re-allowed.
@@ -175,6 +175,7 @@ _PROFILE_TEMPLATE = """\
    (subpath "{home}/.config/opencode")
    (subpath "{home}/.opencode")
    (subpath "{home}/.cline")
+   (subpath "{home}/.zcode")
    (subpath "{home}/.cache")
    (subpath "{home}/Library/Caches"))
 
@@ -202,14 +203,18 @@ _PROFILE_TEMPLATE = """\
 ;; Re-allow sandbox and agent runtime dirs after the deny
 ;; (last-match-wins): a custom workdir inside the data tree still works,
 ;; and each agent can read its own db/auth/lock trees. The auth token is
-;; intentionally included — the agent runs AS the agent CLI user.
+;; intentionally included — the agent runs AS the agent CLI user. zcode's
+;; ~/.zcode must also be WRITABLE above: the CLI re-registers its bundled
+;; marketplace json under plugins/marketplaces/ on startup and exits 1
+;; with EPERM when that open is denied.
 (allow file-read*
    (subpath "{home}/.local/share/opencode")
    (subpath "{home}/.local/state/opencode")
    (subpath "{home}/.cache/opencode")
    (subpath "{home}/.config/opencode")
    (subpath "{home}/.opencode")
-   (subpath "{home}/.cline"))
+   (subpath "{home}/.cline")
+   (subpath "{home}/.zcode"))
 (allow file-read* (subpath "{sandbox}"))
 
 (allow network*)

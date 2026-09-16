@@ -121,6 +121,21 @@ class SandboxTests(unittest.TestCase):
             profile.rindex(f'(subpath "{home}/.cline")'),
         )
 
+    def test_profile_reallows_zcode_runtime_tree(self):
+        """zcode reads AND writes ~/.zcode at startup (bundled marketplace
+        re-registration under plugins/marketplaces/) — a write deny there
+        kills the CLI with EPERM before the first token is generated."""
+        profile = sandbox.seatbelt_profile("/tmp/wk/a-b1234")
+        home = os.path.expanduser("~")
+        # Once in the write-allow section, once in the read re-allow section.
+        self.assertEqual(profile.count(f'(subpath "{home}/.zcode")'), 2)
+        # Last-match-wins ordering: the read re-allow must come AFTER the
+        # blanket read deny.
+        self.assertLess(
+            profile.index("(deny file-read*"),
+            profile.rindex(f'(subpath "{home}/.zcode")'),
+        )
+
     def test_write_seatbelt_profile_roundtrips_and_is_deletable(self):
         path = sandbox.write_seatbelt_profile("/tmp/wk/x-1")
         try:
