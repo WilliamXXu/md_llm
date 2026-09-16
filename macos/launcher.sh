@@ -25,6 +25,19 @@
 
 set -u
 
+# A GUI launch (Finder → the applet's `do shell script`) runs with a minimal
+# PATH (/usr/bin:/bin:/usr/sbin:/sbin) that excludes Homebrew. The launcher's
+# own tools (curl, lsof, find) all live in /bin or /usr/bin so they don't
+# care, but the server spawned below inherits this PATH, and the app shells
+# out to Homebrew-installed CLIs — `autossh` for the remote-Ollama tunnel —
+# which subprocess.Popen() must be able to resolve from it. Re-add the common
+# Homebrew prefixes; MD_LLM_PYTHON is an absolute path and unaffected. (A
+# Terminal launch via run.sh already has the right PATH.)
+for p in /opt/homebrew/bin /usr/local/bin; do
+  [ -d "$p" ] && PATH="$p:$PATH"
+done
+export PATH
+
 PORT="${MD_LLM_PORT:-8599}"
 BASE_URL="http://127.0.0.1:${PORT}"
 WORK_DIR="$HOME/.md_llm"
