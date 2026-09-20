@@ -30,12 +30,16 @@ conversation** button writes it as a plain ``<docstem>__chat_<UTC>.md`` file
 into the **Save location** directory — a memorized choice (settings key
 ``llm.chat_save_dir``, editable in the expander under the save buttons) that
 falls back to the host's ``core.chat_save_dir``. No sidecar metadata, no
-transcript linkage — md_llm has no notion of "transcripts". A **Resend
+transcript linkage — md_llm has no notion of "transcripts". A **↻ Resend
 request** button re-runs the conversation's latest user turn through the same
 send pipeline — handy after a failed call or after switching provider/model;
 a trailing assistant reply is replaced by the new one (and restored if the
-resend can't start). The provider/model/key controls live in this panel under
-the ``chat_`` key namespace.
+resend can't start). A **⏹ Stop reply** button cancels the in-flight stream
+(the agent subprocess behind it is killed); the text streamed so far is kept
+as the reply, or nothing is recorded when none had arrived. Each history
+bubble carries a small **✕** that rewinds the conversation to just before it.
+The provider/model/key controls live in this panel under the ``chat_`` key
+namespace.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import uuid
 from datetime import datetime, timezone
 
 import streamlit as st
@@ -54,6 +59,7 @@ from . import sandbox
 from .autossh import _render_autossh_panel
 from .console import log_event
 from .controls import (
+    DEFAULT_PROVIDER,
     _current_cline_thinking,
     _current_llm_model,
     _current_oai_endpoint,
@@ -80,7 +86,8 @@ from .state import (
 _CHAT_MESSAGES = "_chat_messages"  # list[{"role","content"}]
 # Dict describing the in-flight background stream (see _stream_worker): the LLM
 # call runs in a daemon thread so it survives tab switches — esp. OpenCode's
-# subprocess, whose generator kills the process on close. Keys: text/done/error/source.
+# subprocess, whose generator kills the process tree on close. Keys:
+# text/done/error/source + stop/stopped/stop_key (⏹ Stop reply).
 _CHAT_BG_TASK = "_chat_bg_task"
 
 # A prompt staged by the Reader's ⚡ Summarize quick action for the NEXT chat
@@ -469,14 +476,16 @@ def _safe_stream(gen, holder):
         holder["error"] = str(e)
 
 
-def _build_stream(context_path, holder):
+def _build_stream(context_path, holder, stop_key=None):
     """Return (stream_generator, error) for the current chat_* provider/model.
 
     On a validation failure returns (None, error_message); otherwise returns the
     streaming generator (a ``_safe_stream`` wrapper bound to ``holder``) and None.
+    ``stop_key`` is forwarded to the agent generators (OpenCode/Cline/ZCode),
+    which register their subprocess under it so ⏹ Stop can kill a wedged read.
     """
     p = "chat_"
-    provider = st.session_state.get(f"{p}llm_provider", "OpenRouter")
+    provider = st.session_state.get(f"{p}llm_provider", DEFAULT_PROVIDER)
     model = _current_llm_model(prefix=p)
     instruction = st.session_state.get(f"{p}llm_instruction") or None
 
@@ -559,7 +568,7 @@ def _build_stream(context_path, holder):
         gen = llm.opencode_chat_stream(
             prompt, model=model, workdir=workdir, attach=attach,
             agent=agent, variant=variant, hardened=hardened,
-            instruction=instruction,
+            instruction=instruction, stop_key=stop_key,
         )
     elif provider == "Cline":
         workdir = sandbox.normalize_workdir(
@@ -579,7 +588,7 @@ def _build_stream(context_path, holder):
         prompt = _turns_to_opencode_prompt(turns)
         gen = llm.cline_chat_stream(
             prompt, model=model or None, workdir=workdir, thinking=thinking,
-            hardened=hardened, instruction=instruction,
+            hardened=hardened, instruction=instruction, stop_key=stop_key,
         )
     elif provider == "ZCode":
         workdir = sandbox.normalize_workdir(
@@ -595,7 +604,7 @@ def _build_stream(context_path, holder):
         prompt = _turns_to_opencode_prompt(turns)
         gen = llm.zcode_chat_stream(
             prompt, workdir=workdir, hardened=hardened,
-            instruction=instruction,
+            instruction=instruction, stop_key=stop_key,
         )
     else:
         endpoint = st.session_state.get(
@@ -631,7 +640,7 @@ def _send_staged_quick_prompt(context_path):
     if not prompt:
         return None
 
-    provider = st.session_state.get("chat_llm_provider", "OpenRouter")
+    provider = st.session_state.get("chat_llm_provider", DEFAULT_PROVIDER)
     model = _current_llm_model(prefix="chat_") or "(unknown)"
     chat_src = f"Quick summarize ({provider} · {model})"
     preview = prompt.replace("\n", " ")[:80]
@@ -639,14 +648,18 @@ def _send_staged_quick_prompt(context_path):
 
     msgs = st.session_state.setdefault(_chat_state_key(_CHAT_MESSAGES), [])
     msgs.append({"role": "user", "content": prompt})
+    stop_key = uuid.uuid4().hex
     holder = {}
-    stream, verr = _build_stream(context_path, holder)
+    stream, verr = _build_stream(context_path, holder, stop_key=stop_key)
     if stream is None:
         msgs.pop()  # validation failed: roll back the dangling question
         st.session_state[_chat_state_key("_chat_last_error")] = verr
         log_event(f"Chat failed: {verr}", level="error", source=chat_src)
         return None
-    task = {"text": "", "done": False, "error": None, "source": chat_src}
+    task = {
+        "text": "", "done": False, "error": None, "source": chat_src,
+        "stop": False, "stopped": False, "stop_key": stop_key,
+    }
     worker = threading.Thread(
         target=_stream_worker, args=(task, stream, holder), daemon=True,
     )
@@ -666,6 +679,28 @@ def _has_last_request():
         m.get("role") == "user"
         for m in (st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or [])
     )
+
+
+def _delete_messages_from(index):
+    """Drop the ACTIVE session's message ``index`` and everything after it.
+
+    The ✕ button under each history bubble rewinds the conversation to just
+    before that message: deleting a mid-conversation turn removes its reply
+    too (the model only ever saw a prefix, and the history must stay a valid
+    alternating prefix), and deleting the last message drops only it. When
+    the whole conversation is gone the key is popped entirely, matching what
+    ``Clear conversation`` leaves behind.
+
+    A no-op when the conversation is missing or ``index`` is out of range
+    (the stored list is edited in place — the caller re-renders afterwards).
+    """
+    msgs_key = _chat_state_key(_CHAT_MESSAGES)
+    msgs = st.session_state.get(msgs_key)
+    if not msgs or not 0 <= index < len(msgs):
+        return
+    del msgs[index:]
+    if not msgs:
+        st.session_state.pop(msgs_key, None)
 
 
 def _resend_last_request(context_path):
@@ -704,7 +739,7 @@ def _resend_last_request(context_path):
         st.warning("Nothing to resend — this conversation has no request yet.")
         return None
 
-    provider = st.session_state.get("chat_llm_provider", "OpenRouter")
+    provider = st.session_state.get("chat_llm_provider", DEFAULT_PROVIDER)
     model = _current_llm_model(prefix="chat_") or "(unknown)"
     chat_src = f"LLM chat ({provider} · {model})"
     preview = prompt.replace("\n", " ")[:80]
@@ -716,19 +751,43 @@ def _resend_last_request(context_path):
     del msgs[last_user + 1:]
 
     holder = {}
-    stream, verr = _build_stream(context_path, holder)
+    stop_key = uuid.uuid4().hex
+    stream, verr = _build_stream(context_path, holder, stop_key=stop_key)
     if stream is None:
         msgs.extend(dropped)  # aborted retry must not lose the old reply
         st.session_state[_chat_state_key("_chat_last_error")] = verr
         log_event(f"Chat failed: {verr}", level="error", source=chat_src)
         return None
-    task = {"text": "", "done": False, "error": None, "source": chat_src}
+    task = {
+        "text": "", "done": False, "error": None, "source": chat_src,
+        "stop": False, "stopped": False, "stop_key": stop_key,
+    }
     worker = threading.Thread(
         target=_stream_worker, args=(task, stream, holder), daemon=True,
     )
     st.session_state[_chat_state_key(_CHAT_BG_TASK)] = task
     worker.start()
     return task
+
+
+def _close_stream_quietly(stream):
+    """Close a stream generator, ignoring errors (the stop-reply path).
+
+    Closing runs the generator's ``finally`` blocks — killing an agent
+    subprocess (OpenCode/Cline/ZCode) or closing the HTTP response — so the
+    resources behind a stopped stream are released immediately instead of
+    leaking until the call would have finished on its own. Only ever called
+    from :func:`_stream_worker`, the stream's sole iterator, which keeps the
+    close thread-safe. Plain iterators (e.g. a test's ``list_iterator``) have
+    no ``close`` method and are skipped.
+    """
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:  # noqa: BLE001 — a cleanup failure must not mask the stop
+        pass
 
 
 def _stream_worker(task, stream, holder):
@@ -741,22 +800,77 @@ def _stream_worker(task, stream, holder):
     triggers, which would close the generator and terminate the agent. Iterating
     here keeps the subprocess alive to completion.
 
-    The chat panel reads ``task`` (``text``/``done``/``error``) on each render
-    for live display and finalizes once when ``done`` is set. Must not call any
-    ``st.*`` API (not thread-safe).
+    Honors the cooperative ``task["stop"]`` flag: the ⏹ Stop button sets it
+    (and kills any agent subprocess behind the stream), and the loop checks it
+    between chunks — a stop lands at the next chunk for API providers, while
+    the kill unblocks a wedged agent read immediately. On stop the partial
+    text is kept, the stream is closed (releasing the subprocess / HTTP
+    response) and ``task["stopped"]`` is set; a kill-induced EOF error from
+    the generator is suppressed — the user ended the call, nothing failed.
+
+    The chat panel reads ``task`` (``text``/``done``/``error``/``stopped``) on
+    each render for live display and finalizes once when ``done`` is set. Must
+    not call any ``st.*`` API (not thread-safe).
     """
     buf: list[str] = []
+    stopped = False
     try:
         for chunk in stream:
             if chunk:
                 buf.append(chunk)
                 task["text"] = "".join(buf)
+            if task.get("stop"):
+                stopped = True
+                break
     except Exception as e:  # noqa: BLE001 — surface any provider error
         task["error"] = str(e)
+    if task.get("stop") and (
+        stopped or task.get("error") or holder.get("error")
+    ):
+        # The stop landed mid-chunk (break above) or unblocked a wedged read
+        # into an EOF/exit error (a kill surfaces via _safe_stream's holder —
+        # the worker's loop just ends). Either way the USER ended the call:
+        # keep the partial text, release the stream's resources, and don't
+        # surface a failure. (A stop that lands after the stream already
+        # completed cleanly is NOT marked stopped — the reply is complete;
+        # that flag combo just means the click lost the race.)
+        stopped = True
+        _close_stream_quietly(stream)
+        llm.kill_agent_proc(task.get("stop_key"))  # no-op for API providers
+        holder.pop("error", None)
+        task["error"] = None  # keep the task shape; a stop is not a failure
     if not task.get("error") and holder.get("error"):
         task["error"] = holder["error"]
+    if stopped:
+        task["stopped"] = True
     task["text"] = (task.get("text") or "").strip()
     task["done"] = True
+
+
+def _stop_streaming_reply():
+    """Ask the ACTIVE session's in-flight stream to stop; keep the partial.
+
+    Sets the shared task dict's ``stop`` flag and kills the agent subprocess
+    behind the stream (OpenCode/Cline/ZCode) so a wedged read unblocks at
+    once; for plain-API providers the stop takes effect at the next chunk
+    (sub-second while tokens stream). The worker then closes the stream and
+    marks the task done, and the normal finalize path folds the partial text
+    in as the reply (no reply at all when nothing had arrived — the bare user
+    turn stays, ready for a Resend).
+
+    Returns True when a running task was flagged; False when nothing was
+    streaming (or a stop was already requested — the button is idempotent).
+    """
+    task = st.session_state.get(_chat_state_key(_CHAT_BG_TASK))
+    if not task or task.get("done") or task.get("stop"):
+        return False
+    task["stop"] = True
+    llm.kill_agent_proc(task.get("stop_key"))
+    log_event(
+        "Chat stop requested — keeping the text streamed so far.",
+        level="info", source=task.get("source", ""),
+    )
+    return True
 
 
 @st.fragment(run_every=0.4)
@@ -782,6 +896,11 @@ def _stream_partial_reply(task):
         body = task.get("text") or ""
         if body:
             st.markdown(_escape_currency_dollars(body) + " ▌")
+        elif task.get("stop"):
+            # ⏹ pressed but nothing had streamed yet — the worker is closing
+            # the stream (or draining the kill) and the next finalize folds
+            # in whatever exists, which may be nothing at all.
+            st.caption("_stopping…_")
         else:
             st.caption(
                 "_working… (running in the background — switching tabs is "
@@ -835,6 +954,25 @@ def _finalize_chat_task(task, doc=None, chat_id=None):
                   source=task.get("source", ""))
         return
     reply_text = (task.get("text") or "").strip()
+    if task.get("stopped"):
+        # A user-stopped reply keeps exactly the text that arrived before the
+        # stop — no "empty response" placeholder (nothing was wrong with the
+        # call; the user just ended it). With no text at all, no reply is
+        # recorded: the user turn stays bare, ready for a Resend.
+        if reply_text:
+            st.session_state.setdefault(msg_key, []).append({
+                "role": "assistant",
+                "content": reply_text,
+            })
+            log_event(
+                f"Chat reply stopped after {len(reply_text)} chars "
+                "(partial kept)",
+                level="info", source=task.get("source", ""),
+            )
+        else:
+            log_event("Chat reply stopped — no text had arrived.",
+                      level="info", source=task.get("source", ""))
+        return
     st.session_state.setdefault(msg_key, []).append({
         "role": "assistant",
         "content": reply_text
@@ -1121,6 +1259,247 @@ def _tame_chat_autoscroll():
     )
 
 
+def _dock_input_bar_buttons():
+    """Dock \u2b1c Stop reply and \u21bb Resend request beside the input's Send arrow.
+
+    Streamlit pins ``st.chat_input`` to the bottom bar and lets nothing else
+    render in that row \u2014 but "next to Send" is where a stop/resend pair
+    belongs (the archived NiceGUI line had exactly that pair beside its
+    input). So the two buttons STAY real Streamlit widgets rendered in the
+    controls row \u2014 those nodes are the functional anchors: React owns them
+    and a click on one posts its widget event \u2014 and a same-origin script
+    (the ``components.html`` pattern :func:`_tame_chat_autoscroll` uses)
+    mirrors them into the input bar:
+
+      * a clone of each anchor is docked in a fixed order \u2014 \u2b1c Stop, then
+        \u21bb Resend \u2014 immediately RIGHT of Send, which stays leftmost;
+      * clicks on a clone are forwarded to its anchor (``.click()``), so the
+        action goes through the normal Streamlit widget pipeline;
+      * each clone's ``disabled`` state and tooltip are mirrored from its
+        anchor, and the anchors' row positions are hidden while the dock
+        lives;
+      * the Send arrow itself \u2014 a 32px square, a runt next to the pair's
+        40px-tall regular buttons \u2014 is enlarged inline to the docked
+        clone's measured border-box height, so all three read as one row
+        of equal buttons.
+
+    Two installation paths, because each fails differently: a PARENT-REALM
+    INJECTED SCRIPT (its MutationObserver survives the component iframe being
+    reloaded \u2014 same reasoning as :func:`_tame_chat_autoscroll`) occasionally
+    loses a race with a Streamlit rerun and silently never executes; so the
+    loader ALSO runs the sync on an IFRAME-REALM TIMER (700 ms) against the
+    parent document. The timer dies with its iframe and the next component
+    mount reinstalls it \u2014 together the paths are self-healing. Both are
+    idempotent: the sync is a pure re-anchor + re-mirror. If neither path
+    runs (no JS, or Streamlit's DOM changes shape) the buttons simply stay in
+    the controls row \u2014 the anchor render is untouched, so this degrades to
+    the pre-dock behaviour.
+
+    Must be called on EVERY chat render, like _tame_chat_autoscroll.
+    """
+    components.html(
+        """
+<script>
+(function () {
+  try {
+    var w = window.parent;
+    var d = w.document;
+
+    // Self-contained installer: all dock state lives under `doc`. Runs once
+    // in the parent realm (injected \u2014 observer survives iframe reloads) or
+    // per-tick in this realm (fallback timer; dies with this iframe, and the
+    // next component mount reinstalls it).
+    function installer(doc) {
+      if (doc.__mdllm_chat_resend_dock_active) return;
+      doc.__mdllm_chat_resend_dock_active = true;
+      var DOCK_ID = 'mdllm-resend-dock';
+      // Docked in this order, left to right, right after Send (Send stays
+      // leftmost — it leads the row, the pair trails it).
+      var SLOTS = [
+        { name: 'stop', label: /Stop reply/,
+          tipOn: 'Stop reply \u2014 cancel the in-flight reply; the text '
+                 + 'streamed so far is kept.',
+          tipOff: 'Stop reply \u2014 nothing is streaming right now.' },
+        { name: 'resend', label: /Resend request/,
+          tipOn: 'Resend request \u2014 re-runs the latest request; the '
+                 + 'trailing reply is replaced.',
+          tipOff: 'Resend request \u2014 wakes up after your first message.' }
+      ];
+
+      // The anchor: the real Streamlit button in the controls row. With a
+      // ``help`` tooltip set, Streamlit's frontend renders the trigger TWICE
+      // inside the same stButton wrapper \u2014 the live React-updated copy
+      // inside span[data-testid="stTooltipHoverTarget"] (the tooltip's
+      // floating-ui anchor) and a hidden twin for the tooltip's own
+      // positioning. Anchor on the structural hover-target copy \u2014 DOM-order
+      // or visibility heuristics pick the frozen twin half the time.
+      function findAnchor(re) {
+        var targets = doc.querySelectorAll(
+            'span[data-testid="stTooltipHoverTarget"] > button');
+        for (var i = 0; i < targets.length; i++) {
+          var b = targets[i];
+          if (!b.closest('[data-testid="stBottom"]')
+              && re.test(b.textContent || '')) return b;
+        }
+        // Fallback for buttons rendered without a tooltip wrapper.
+        var btns = doc.querySelectorAll('[data-testid="stButton"] button');
+        for (var j = 0; j < btns.length; j++) {
+          var c = btns[j];
+          if (!c.closest('[data-testid="stBottom"]')
+              && re.test(c.textContent || '')) return c;
+        }
+        return null;
+      }
+
+      // The input bar's flex row and the Send button's wrapper in it.
+      function dockParts() {
+        var send = doc.querySelector('[data-testid="stChatInputSubmitButton"]');
+        if (!send) return null;
+        var sendWrap = send.parentElement;
+        var row = sendWrap && sendWrap.parentElement;
+        if (!row) return null;
+        return { row: row, sendWrap: sendWrap, send: send };
+      }
+
+      function ensureSlot(dock, spec, anchor) {
+        var slot = dock.querySelector('[data-slot="' + spec.name + '"]');
+        if (!anchor) {
+          if (slot) slot.remove();
+          return;
+        }
+        var wrap = anchor.closest('[data-testid="stButton"]') || anchor;
+        // Hide the anchor's spot in the controls row while docked.
+        if (wrap.style.display !== 'none') wrap.style.display = 'none';
+        if (!slot) {
+          slot = doc.createElement('span');
+          slot.setAttribute('data-slot', spec.name);
+          slot.style.cssText = 'display:flex;align-items:center;';
+          dock.appendChild(slot);
+        }
+        // Rebuild the clone whenever React re-created the anchor. The click
+        // forwards by LABEL (resolved at click time, not captured): the
+        // anchor node can be swapped by React between the clone's build and
+        // the user's click, and a captured node would then hit a detached
+        // button that no widget listens on.
+        if (slot.__src !== wrap) {
+          slot.textContent = '';
+          var clone = anchor.cloneNode(true);
+          clone.removeAttribute('id');
+          clone.addEventListener('click', function (ev) {
+            ev.preventDefault();
+            var live = findAnchor(spec.label);
+            if (live) live.click();   // forward to the real widget button
+          });
+          slot.appendChild(clone);
+          slot.__src = wrap;
+        }
+        var clone = slot.firstChild;
+        if (clone) {
+          if (clone.disabled !== anchor.disabled) clone.disabled = anchor.disabled;
+          var tip = anchor.disabled ? spec.tipOff : spec.tipOn;
+          if (clone.getAttribute('title') !== tip) clone.setAttribute('title', tip);
+        }
+      }
+
+      function sync() {
+        var parts = dockParts();
+        var hasAnchor = false;
+        for (var i = 0; i < SLOTS.length; i++) {
+          if (findAnchor(SLOTS[i].label)) { hasAnchor = true; break; }
+        }
+        var dock = doc.getElementById(DOCK_ID);
+        if (!parts || !hasAnchor) {
+          if (dock) dock.remove();   // chat view unmounted: undock
+          return;
+        }
+        if (!dock) {
+          dock = doc.createElement('div');
+          dock.id = DOCK_ID;
+          dock.style.cssText =
+            'display:flex;align-items:center;margin-left:8px;gap:6px;';
+          parts.sendWrap.insertAdjacentElement('afterend', dock);
+        } else if (dock.previousElementSibling !== parts.sendWrap) {
+          // Streamlit rebuilt the row: re-dock right of Send.
+          parts.sendWrap.insertAdjacentElement('afterend', dock);
+        }
+        for (var k = 0; k < SLOTS.length; k++) {
+          ensureSlot(dock, SLOTS[k], findAnchor(SLOTS[k].label));
+        }
+        // Keep the dock's internal order fixed: stop before resend.
+        var stopSlot = dock.querySelector('[data-slot="stop"]');
+        var resendSlot = dock.querySelector('[data-slot="resend"]');
+        if (stopSlot && resendSlot
+            && stopSlot.nextElementSibling !== resendSlot)
+          dock.insertBefore(stopSlot, resendSlot);
+        // Size Send to match the docked pair: the chat input's arrow is a
+        // 32px square while regular st.buttons render 40px tall, so Send
+        // reads as the runt of the row. Copy the first docked clone's
+        // measured border-box height onto Send (kept square — it's an
+        // icon button) and its wrapper, as inline styles. React never
+        // writes these style properties, so they survive its rerenders,
+        // and this runs every sync to re-apply after a remount.
+        var pair = dock.querySelector('[data-slot] button');
+        if (pair && parts.send) {
+          var h = pair.getBoundingClientRect().height;
+          if (h > 0) {
+            var px = Math.round(h) + 'px';
+            var btn = parts.send.style;
+            if (btn.height !== px) {
+              btn.height = px;
+              btn.minHeight = px;
+              btn.width = px;
+              btn.minWidth = px;
+              parts.sendWrap.style.minHeight = px;
+              parts.sendWrap.style.minWidth = px;
+            }
+          }
+        }
+      }
+
+      if (doc.__mdllm_chat_resend_dock_observer) return;
+      doc.__mdllm_chat_resend_dock_observer = true;
+      var mo = new MutationObserver(function () { sync(); });
+      mo.observe(doc.body, {
+        childList: true, subtree: true,
+        attributes: true, attributeFilter: ['disabled', 'style', 'class']
+      });
+      sync();
+      // Mutation-covered state flips plus a periodic sweep, in case a
+      // mirroring-relevant change ever bypasses the observer.
+      setInterval(sync, 700);
+    }
+
+    // Path 1: parent-realm injection (observer + sync timer run in the
+    // parent realm and survive iframe reloads). The installer flips the
+    // document flag on execution, which stops the retries below.
+    if (!d.__mdllm_chat_resend_dock_active) {
+      try {
+        var s = d.createElement('script');
+        s.textContent = '(' + installer.toString() + ')(document);';
+        (d.head || d.documentElement).appendChild(s);
+      } catch (e) {}
+    }
+    // Path 2: iframe-realm retry. An appended script element occasionally
+    // loses the execution race with a Streamlit rerun and silently never
+    // runs — so while the flag is still unset, re-append the installer every
+    // 700 ms until one copy executes. This timer dies with this iframe; the
+    // next component mount reinstalls it.
+    w.setInterval(function () {
+      try {
+        if (d.__mdllm_chat_resend_dock_active) return;
+        var s2 = d.createElement('script');
+        s2.textContent = '(' + installer.toString() + ')(document);';
+        (d.head || d.documentElement).appendChild(s2);
+      } catch (e) {}
+    }, 700);
+  } catch (e) {}
+})();
+</script>
+""",
+        height=0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Control continuity across view switches
 # ---------------------------------------------------------------------------
@@ -1347,9 +1726,11 @@ def render_chat():
             st.session_state.pop(_staged_quick_prompt_key(), None)
             st.rerun()
 
-    col_save, col_clear, col_resend, _ = st.columns([1, 1, 1, 1])
+    col_save, col_clear, col_resend, col_stop, _ = st.columns(
+        [1, 1, 1, 1, 1]
+    )
     if col_save.button("Save conversation"):
-        provider = st.session_state.get("chat_llm_provider", "OpenRouter")
+        provider = st.session_state.get("chat_llm_provider", DEFAULT_PROVIDER)
         model = _current_llm_model(prefix="chat_") or "(none)"
         saved = _save_conversation(context_path, provider, model)
         if saved:
@@ -1367,7 +1748,7 @@ def render_chat():
     # this same run continue into the streaming-bubble block below (the same
     # in-render handoff the staged ⚡ prompt uses).
     if col_resend.button(
-        "Resend request",
+        "↻ Resend request",
         key=_RESEND_BUTTON_KEY,
         disabled=bool(_task) or not _has_last_request(),
         help=(
@@ -1380,6 +1761,32 @@ def render_chat():
         _started = _resend_last_request(context_path)
         if _started:
             _task = _started
+    # ⏹ Stop reply (ported from the archived NiceGUI line): flags the
+    # in-flight stream and kills any agent subprocess behind it; the text
+    # streamed so far is kept and finalized like any completed stream.
+    # The anchor renders always (the dock mirrors it beside Send, where the
+    # archived line had it) and is enabled only while a reply is streaming
+    # and a stop hasn't been requested yet (idempotent).
+    if col_stop.button(
+        "⏹ Stop reply",
+        key="_chat_stop_reply",
+        disabled=not _task or _task.get("stop"),
+        help=(
+            "Cancel the in-flight reply. The text streamed so far is kept "
+            "as the reply; with nothing arrived, the request stays bare "
+            "for a Resend."
+        ),
+    ):
+        _stop_streaming_reply()
+    # The disabled button reads as "missing" on a fresh conversation (the
+    # greyed label is easy to skim past), so say out loud when it wakes up.
+    # Self-resolves: it disappears with the first sent request.
+    if not _has_last_request():
+        st.caption(
+            "↻ **Resend request** wakes up after your first message — it "
+            "re-runs the latest request (e.g. after a failed call or a "
+            "provider/model switch)."
+        )
 
     # --- Save location (memorized; default = the host's chat_save_dir) ---
     # Rendered every run, even collapsed: the on_change callback persists each
@@ -1421,12 +1828,30 @@ def render_chat():
     # back down after they scroll away (see _tame_chat_autoscroll). Mounted
     # on every chat render so it re-arms whenever the chat view remounts.
     _tame_chat_autoscroll()
+    # Dock ⏹ Stop / ↻ Resend beside the chat input's Send arrow (every
+    # render; see _dock_input_bar_buttons for why this is a script mirror).
+    _dock_input_bar_buttons()
 
     # --- Chat history --------------------------------------------------
     messages = st.session_state.get(_chat_state_key(_CHAT_MESSAGES)) or []
-    for m in messages:
+    for i, m in enumerate(messages):
         with st.chat_message(m["role"]):
             st.markdown(_escape_currency_dollars(m["content"]))
+            # ✕ rewind (ported from the archived NiceGUI line): drops this
+            # message and everything after it. Disabled while a reply
+            # streams — the in-flight reply finalizes into the tail this
+            # button would drop, so Stop first, then delete.
+            if st.button(
+                "✕",
+                key=f"_chat_del_{i}",
+                disabled=bool(_task),
+                help=(
+                    "Delete this message and every message after it — the "
+                    "conversation rewinds to just before it."
+                ),
+            ):
+                _delete_messages_from(i)
+                st.rerun()
 
     # Surface the last failed call as a transient bubble (not stored).
     err = st.session_state.pop(_chat_state_key("_chat_last_error"), None)
@@ -1464,7 +1889,7 @@ def render_chat():
         # Append the user turn BEFORE building the stream — _build_stream
         # snapshots the conversation at call time into the generator, so the
         # new question must already be in _CHAT_MESSAGES for the model to see.
-        provider = st.session_state.get("chat_llm_provider", "OpenRouter")
+        provider = st.session_state.get("chat_llm_provider", DEFAULT_PROVIDER)
         model = _current_llm_model(prefix="chat_") or "(unknown)"
         chat_src = f"LLM chat ({provider} · {model})"
         preview = prompt.strip().replace("\n", " ")[:80]
@@ -1472,8 +1897,9 @@ def render_chat():
 
         msgs = st.session_state.setdefault(_chat_state_key(_CHAT_MESSAGES), [])
         msgs.append({"role": "user", "content": prompt})
+        stop_key = uuid.uuid4().hex
         holder = {}
-        stream, verr = _build_stream(context_path, holder)
+        stream, verr = _build_stream(context_path, holder, stop_key=stop_key)
         if stream is None:
             msgs.pop()  # validation failed: roll back the dangling question
             st.session_state[_chat_state_key("_chat_last_error")] = verr
@@ -1485,7 +1911,12 @@ def render_chat():
             # st.write_stream would be cancelled by the tab-switch rerun, and
             # the stream's generator kills its subprocess on close. The
             # polling fragment above drains `task` for live display.
-            task = {"text": "", "done": False, "error": None, "source": chat_src}
+            task = {
+                "text": "", "done": False, "error": None,
+                "source": chat_src,
+                "stop": False, "stopped": False,
+                "stop_key": stop_key,
+            }
             worker = threading.Thread(
                 target=_stream_worker, args=(task, stream, holder),
                 daemon=True,

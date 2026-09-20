@@ -65,11 +65,11 @@ class ProviderKindSeparationTests(unittest.TestCase):
         for k in self.KEYS:
             st.session_state.pop(k, None)
 
-    def test_fresh_session_defaults_to_the_api_group(self):
+    def test_fresh_session_defaults_to_opencode(self):
         controls._seed_provider_kind("chat_")
-        self.assertEqual(st.session_state["chat_llm_kind"], "api")
+        self.assertEqual(st.session_state["chat_llm_kind"], "agents")
         self.assertEqual(
-            st.session_state["chat_llm_api_provider"], "OpenRouter"
+            st.session_state["chat_llm_agent_provider"], "OpenCode"
         )
 
     def test_legacy_agent_provider_migrates_to_the_agent_group(self):
@@ -100,7 +100,7 @@ class ProviderKindSeparationTests(unittest.TestCase):
         controls._seed_provider_kind("chat_")
         controls._seed_provider_kind("")  # bare-prefix panel, fresh session
         self.assertEqual(st.session_state["chat_llm_kind"], "agents")
-        self.assertEqual(st.session_state["llm_kind"], "api")
+        self.assertEqual(st.session_state["llm_kind"], "agents")
 
     def test_the_groups_partition_the_providers(self):
         # The mirror and the kind radios rely on the split being a partition

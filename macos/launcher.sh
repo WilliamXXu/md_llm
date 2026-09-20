@@ -14,7 +14,7 @@
 # md_llm.app._open_query_docs.
 #
 # A freshly booted server also gets an idle reaper: once no browser tab has
-# held a connection for MD_LLM_IDLE_TIMEOUT seconds (default 15 min), the
+# held a connection for MD_LLM_IDLE_TIMEOUT seconds (default 1 min), the
 # reaper stops the server — closing the tab doesn't leave it resident
 # forever, and the next launch boots a fresh one.
 #
@@ -26,14 +26,17 @@
 set -u
 
 # A GUI launch (Finder → the applet's `do shell script`) runs with a minimal
-# PATH (/usr/bin:/bin:/usr/sbin:/sbin) that excludes Homebrew. The launcher's
-# own tools (curl, lsof, find) all live in /bin or /usr/bin so they don't
-# care, but the server spawned below inherits this PATH, and the app shells
-# out to Homebrew-installed CLIs — `autossh` for the remote-Ollama tunnel —
-# which subprocess.Popen() must be able to resolve from it. Re-add the common
-# Homebrew prefixes; MD_LLM_PYTHON is an absolute path and unaffected. (A
-# Terminal launch via run.sh already has the right PATH.)
-for p in /opt/homebrew/bin /usr/local/bin; do
+# PATH (/usr/bin:/bin:/usr/sbin:/sbin) that excludes Homebrew and the per-user
+# CLI install dirs. The launcher's own tools (curl, lsof, find) all live in
+# /bin or /usr/bin so they don't care, but the server spawned below inherits
+# this PATH, and the app shells out to CLIs installed elsewhere — Homebrew
+# (`autossh` for the remote-Ollama tunnel, `cline`, `zcode`) and per-user
+# trees (opencode's installer uses ~/.opencode/bin; ~/.local/bin and ~/bin
+# are other common spots) — which subprocess.Popen() must be able to resolve
+# from it. Re-add those prefixes; MD_LLM_PYTHON is an absolute path and
+# unaffected. (A Terminal launch via run.sh already has the right PATH.)
+for p in /opt/homebrew/bin /usr/local/bin \
+         "$HOME/.opencode/bin" "$HOME/.local/bin" "$HOME/bin"; do
   [ -d "$p" ] && PATH="$p:$PATH"
 done
 export PATH
@@ -45,7 +48,7 @@ UPLOADS_DIR="$WORK_DIR/uploads"
 LOG="$WORK_DIR/server.log"
 PID_FILE="$WORK_DIR/server.pid"
 CHROME="${MD_LLM_CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
-IDLE_LIMIT="${MD_LLM_IDLE_TIMEOUT:-900}"  # seconds of no open tab before shutdown; 0 disables
+IDLE_LIMIT="${MD_LLM_IDLE_TIMEOUT:-60}"  # seconds of no open tab before shutdown; 0 disables
 CHECK_INTERVAL=60                         # idle-poll granularity
 
 mkdir -p "$UPLOADS_DIR"
@@ -74,6 +77,13 @@ purge_stale_uploads() {
 # like the server itself so it keeps watching after this launcher exits.
 watchdog() {
   local idle=0
+  # Grace period: the launcher opens the browser tab only after the server
+  # is up, so early polls legitimately see zero connections — and with
+  # IDLE_LIMIT at or below CHECK_INTERVAL, the very first poll would kill
+  # the server before its first tab ever connects. Sit out one interval
+  # before polling; by then a launched tab has connected (or the idle
+  # count starts from zero as if the tab had just closed).
+  sleep "$CHECK_INTERVAL"
   while kill -0 "$BOOT_PID" 2>/dev/null; do
     if lsof -nP -iTCP:"$PORT" -sTCP:ESTABLISHED >/dev/null 2>&1; then
       idle=0

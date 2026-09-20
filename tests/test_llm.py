@@ -11,6 +11,7 @@ Ported from transcriber_system's test_llm_openai.py, retargeted at md_llm.
 
 import io
 import json
+import signal
 import subprocess
 import unittest
 from unittest import mock
@@ -535,6 +536,34 @@ class OpencodeChatStreamTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 list(llm.opencode_chat_stream("hi", model="m"))
 
+    def test_spawns_its_own_process_group_for_stop_support(self):
+        # start_new_session puts the agent (hardened mode's sandbox-exec AND
+        # the grandchild CLI behind it, plus every tool child) in a process
+        # group of its own — ⏹ Stop's killpg depends on pgid == pid.
+        captured, fake = self._capture(
+            [json.dumps({"type": "text", "part": {"text": "ok"}})]
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            list(llm.opencode_chat_stream("hi", model="m"))
+        self.assertIs(captured["kwargs"].get("start_new_session"), True)
+
+    def test_registers_the_live_proc_under_stop_key_and_unregisters(self):
+        # The registry must hold the Popen while the generator runs — a Stop
+        # can arrive while it is blocked mid-read — and be empty again after.
+        seen = []
+
+        def lines():
+            yield json.dumps({"type": "text", "part": {"text": "a"}})
+            seen.append(sorted(llm._LIVE_AGENT_PROCS))
+            yield json.dumps({"type": "text", "part": {"text": "b"}})
+
+        captured, fake = self._capture(lines())
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            out = list(llm.opencode_chat_stream("hi", model="m", stop_key="t"))
+        self.assertEqual(seen, [["t"]])
+        self.assertEqual(out, ["a", "b"])
+        self.assertEqual(llm._LIVE_AGENT_PROCS, {})
+
     def test_empty_prompt_raises_valueerror(self):
         with self.assertRaises(ValueError):
             list(llm.opencode_chat_stream("", model="m"))
@@ -550,6 +579,8 @@ class OpencodeChatStreamTests(unittest.TestCase):
              mock.patch.object(
                  llm.sandbox, "write_seatbelt_profile",
                  side_effect=lambda wd: profile), \
+             mock.patch("shutil.which",
+                        return_value="/fake/bin/opencode") as m_which, \
              mock.patch.object(llm, "_unlink_quietly") as m_unlink:
             list(llm.opencode_chat_stream("hi", model="m", workdir="/tmp/s",
                                           hardened=True))
@@ -557,10 +588,24 @@ class OpencodeChatStreamTests(unittest.TestCase):
         self.assertEqual(a[0], "sandbox-exec")
         self.assertEqual(a[1], "-f")
         self.assertEqual(a[2], profile)
-        self.assertEqual(a[3], "opencode")
+        # sandbox-exec execvp()s the wrapped CLI against the inherited PATH,
+        # so the binary must be handed over as an absolute path.
+        self.assertEqual(a[3], "/fake/bin/opencode")
+        m_which.assert_called_once_with("opencode")
         self.assertEqual(a[a.index("--dir") + 1], "/tmp/s")
         # The temp profile is deleted once the stream ends.
         m_unlink.assert_called_once_with(profile)
+
+    def test_hardened_unresolvable_binary_raises_before_popen(self):
+        with mock.patch("subprocess.Popen") as m_popen, \
+             mock.patch.object(
+                 llm.sandbox, "seatbelt_available", return_value=True), \
+             mock.patch("shutil.which", return_value=None):
+            with self.assertRaises(RuntimeError) as cm:
+                list(llm.opencode_chat_stream("hi", model="m", hardened=True))
+        self.assertIn("opencode", str(cm.exception))
+        self.assertIn("PATH", str(cm.exception))
+        m_popen.assert_not_called()
 
     def test_not_hardened_keeps_plain_argv(self):
         captured, fake = self._capture(
@@ -831,16 +876,32 @@ class ClineChatStreamTests(unittest.TestCase):
              mock.patch.object(
                  llm.sandbox, "write_seatbelt_profile",
                  side_effect=lambda wd: profile), \
+             mock.patch("shutil.which",
+                        return_value="/fake/bin/cline") as m_which, \
              mock.patch.object(llm, "_unlink_quietly") as m_unlink:
             list(llm.cline_chat_stream("hi", workdir="/tmp/s", hardened=True))
         a = captured["args"]
         self.assertEqual(a[0], "sandbox-exec")
         self.assertEqual(a[1], "-f")
         self.assertEqual(a[2], profile)
-        self.assertEqual(a[3], "cline")
+        # Absolute path, for the same execvp-under-sandbox-exec reason as
+        # opencode's hardened test above.
+        self.assertEqual(a[3], "/fake/bin/cline")
+        m_which.assert_called_once_with("cline")
         self.assertEqual(a[a.index("--cwd") + 1], "/tmp/s")
         # The temp profile is deleted once the stream ends.
         m_unlink.assert_called_once_with(profile)
+
+    def test_hardened_unresolvable_binary_raises_before_popen(self):
+        with mock.patch("subprocess.Popen") as m_popen, \
+             mock.patch.object(
+                 llm.sandbox, "seatbelt_available", return_value=True), \
+             mock.patch("shutil.which", return_value=None):
+            with self.assertRaises(RuntimeError) as cm:
+                list(llm.cline_chat_stream("hi", hardened=True))
+        self.assertIn("cline", str(cm.exception))
+        self.assertIn("PATH", str(cm.exception))
+        m_popen.assert_not_called()
 
     def test_not_hardened_keeps_plain_argv(self):
         captured, fake = self._capture(
@@ -863,6 +924,17 @@ class ClineChatStreamTests(unittest.TestCase):
                  llm.sandbox, "seatbelt_available", return_value=False):
             list(llm.cline_chat_stream("hi", hardened=True))
         self.assertEqual(captured["args"][0], "cline")
+
+    def test_spawns_its_own_process_group_for_stop_support(self):
+        # Same contract as opencode's: ⏹ Stop's killpg needs pgid == pid to
+        # reach sandbox-exec's grandchild CLI and the agent's tool children.
+        captured, fake = self._capture(
+            [json.dumps({"ts": 1, "type": "run_result",
+                         "finishReason": "completed", "text": "ok"})]
+        )
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            list(llm.cline_chat_stream("hi"))
+        self.assertIs(captured["kwargs"].get("start_new_session"), True)
 
 
 class ClineToolLabelTests(unittest.TestCase):
@@ -967,6 +1039,61 @@ class ClineListModelsTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
             llm.list_cline_models()
         self.assertNotIn("Authorization", captured["headers"])
+
+
+class KillAgentProcTests(unittest.TestCase):
+    """kill_agent_proc: kill the registered tree by token, then unregister.
+
+    ⏹ Stop reply calls this with the task's stop_key while the stream's
+    generator sits blocked on stdout; the kill must reach the WHOLE process
+    group (start_new_session makes pgid == pid), not just the direct child —
+    in hardened mode that child is sandbox-exec and the real CLI is its
+    grandchild, still holding the stdout pipe.
+    """
+
+    def setUp(self):
+        # The registry is module-global; a failing assertion must not leak
+        # its entry into later tests.
+        self.addCleanup(llm._LIVE_AGENT_PROCS.clear)
+
+    def test_kills_the_registered_group_and_unregisters(self):
+        proc = mock.Mock()
+        proc.pid = 4242
+        llm._register_agent_proc("tok", proc)
+        with mock.patch("os.killpg") as m_killpg:
+            self.assertTrue(llm.kill_agent_proc("tok"))
+        m_killpg.assert_called_once_with(4242, signal.SIGKILL)
+        proc.kill.assert_called_once()  # belt-and-braces direct kill
+        self.assertNotIn("tok", llm._LIVE_AGENT_PROCS)
+        # A second kill is a no-op: the token was popped.
+        with mock.patch("os.killpg") as m_killpg2:
+            self.assertFalse(llm.kill_agent_proc("tok"))
+        m_killpg2.assert_not_called()
+
+    def test_group_already_gone_still_kills_proc_directly(self):
+        # A stop racing the stream's own cleanup can find a dead group; the
+        # direct kill must still run (reaping a zombie) and never raise.
+        proc = mock.Mock()
+        proc.pid = 4242
+        llm._register_agent_proc("tok", proc)
+        with mock.patch("os.killpg", side_effect=ProcessLookupError):
+            self.assertTrue(llm.kill_agent_proc("tok"))
+        proc.kill.assert_called_once()
+        self.assertNotIn("tok", llm._LIVE_AGENT_PROCS)
+
+    def test_unknown_or_missing_token_is_a_noop(self):
+        self.assertFalse(llm.kill_agent_proc("never-registered"))
+        self.assertFalse(llm.kill_agent_proc(None))
+        self.assertFalse(llm.kill_agent_proc(""))
+
+    def test_registration_needs_a_token(self):
+        # stop_key=None (a stream built without stop support) must never
+        # shadow a real registration — the registry is keyed by token only.
+        proc = mock.Mock()
+        llm._register_agent_proc(None, proc)
+        self.assertEqual(llm._LIVE_AGENT_PROCS, {})
+        llm._unregister_agent_proc(None)  # also a no-op
+        self.assertEqual(llm._LIVE_AGENT_PROCS, {})
 
 
 if __name__ == "__main__":

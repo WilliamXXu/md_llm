@@ -71,11 +71,11 @@ just export it):
 - `MD_LLM_PORT` — server port (default `8599`)
 - `MD_LLM_CHROME` — browser executable (default system Chrome)
 - `MD_LLM_IDLE_TIMEOUT` — seconds with no open browser tab before the server
-  stops itself (default `900`; `0` keeps it running until killed)
+  stops itself (default `60`; `0` keeps it running until killed)
 
 Server lifecycle: it runs detached, logging to `~/.md_llm/server.log`. Each
 open browser tab holds one WebSocket, so when the last tab closes and stays
-closed — 15 minutes by default (`MD_LLM_IDLE_TIMEOUT`) — the server stops
+closed — 1 minute by default (`MD_LLM_IDLE_TIMEOUT`) — the server stops
 itself and logs it; the next launch boots a fresh one (which also re-purges
 stale uploads). To stop it sooner: `kill $(cat ~/.md_llm/server.pid)`.
 After editing `macos/launcher.sh`, re-run `install_app.sh --force` — the

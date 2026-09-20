@@ -178,6 +178,8 @@ class ZcodeChatStreamTests(unittest.TestCase):
              mock.patch.object(
                  llm.sandbox, "write_seatbelt_profile",
                  side_effect=lambda wd: profile), \
+             mock.patch("shutil.which",
+                        return_value="/fake/bin/zcode") as m_which, \
              mock.patch.object(llm, "_unlink_quietly") as m_unlink:
             list(llm.zcode_chat_stream(
                 "hi", workdir="/tmp/s", hardened=True))
@@ -185,10 +187,24 @@ class ZcodeChatStreamTests(unittest.TestCase):
         self.assertEqual(a[0], "sandbox-exec")
         self.assertEqual(a[1], "-f")
         self.assertEqual(a[2], profile)
-        self.assertEqual(a[3], "zcode")
+        # Absolute path, for the same execvp-under-sandbox-exec reason as
+        # opencode's hardened test above.
+        self.assertEqual(a[3], "/fake/bin/zcode")
+        m_which.assert_called_once_with("zcode")
         self.assertEqual(a[a.index("--cwd") + 1], "/tmp/s")
         # The temp profile is deleted once the stream ends.
         m_unlink.assert_called_once_with(profile)
+
+    def test_hardened_unresolvable_binary_raises_before_popen(self):
+        with mock.patch("subprocess.Popen") as m_popen, \
+             mock.patch.object(
+                 llm.sandbox, "seatbelt_available", return_value=True), \
+             mock.patch("shutil.which", return_value=None):
+            with self.assertRaises(RuntimeError) as cm:
+                list(llm.zcode_chat_stream("hi", hardened=True))
+        self.assertIn("zcode", str(cm.exception))
+        self.assertIn("PATH", str(cm.exception))
+        m_popen.assert_not_called()
 
     def test_not_hardened_keeps_plain_argv(self):
         captured, fake = self._capture(_zcode_result_json("ok"))
@@ -197,6 +213,14 @@ class ZcodeChatStreamTests(unittest.TestCase):
                  llm.sandbox, "seatbelt_available", return_value=True):
             list(llm.zcode_chat_stream("hi", hardened=False))
         self.assertEqual(captured["args"][0], "zcode")
+
+    def test_spawns_its_own_process_group_for_stop_support(self):
+        # Same contract as opencode/cline: ⏹ Stop's killpg needs pgid == pid
+        # to reach sandbox-exec's grandchild CLI and any tool children.
+        captured, fake = self._capture(_zcode_result_json("ok"))
+        with mock.patch("subprocess.Popen", side_effect=fake):
+            list(llm.zcode_chat_stream("hi"))
+        self.assertIs(captured["kwargs"].get("start_new_session"), True)
 
     def test_hardened_without_seatbelt_degrades_to_plain_argv(self):
         captured, fake = self._capture(_zcode_result_json("ok"))

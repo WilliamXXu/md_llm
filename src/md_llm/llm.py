@@ -21,8 +21,11 @@ no-extra-deps style of transcribe_local.py's remote-Whisper client.
 """
 
 import os
+import atexit
 import json
 import re
+import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -1064,6 +1067,106 @@ def highest_opencode_variant(variants):
     return best
 
 
+def _seatbelt_wrap(args, workdir):
+    """Wrap ``args`` in sandbox-exec with a fresh profile; return the new args.
+
+    args[0] (the agent CLI) is resolved to an absolute path first: sandbox-exec
+    execvp()s the wrapped command against the inherited PATH, which a GUI
+    launch keeps minimal (macos/launcher.sh only re-adds a few prefixes), so a
+    relative name like "opencode" installed in ~/.opencode/bin dies with the
+    opaque "sandbox-exec: execvp() ... failed: No such file or directory"
+    (exit 71) instead of running. Raises RuntimeError naming the binary when
+    even the server's PATH cannot resolve it; returns (wrapped_args,
+    profile_path) so the caller can unlink the profile when the run ends.
+    """
+    binary = shutil.which(args[0])
+    if not binary:
+        raise RuntimeError(
+            f"Could not find the {args[0]!r} executable on the server's "
+            "PATH. Install it (and make sure its directory is on the PATH "
+            "the md_llm server inherits — see SETUP.md on GUI launches)."
+        )
+    profile_path = sandbox.write_seatbelt_profile(workdir or ".")
+    return ["sandbox-exec", "-f", profile_path, binary] + args[1:], profile_path
+
+
+# --- live agent subprocess registry (Stop-reply support) --------------------
+#
+# The chat panel's Stop button must be able to kill a wedged agent read
+# immediately, not just ask the stream to stop at the next chunk (which never
+# comes while the worker is blocked on stdout). Each agent stream generator
+# registers its Popen here under the caller-supplied ``stop_key`` token the
+# moment it spawns, and unregisters in its ``finally``; the UI kills by token.
+_LIVE_AGENT_PROCS: dict = {}
+
+
+def _register_agent_proc(stop_key, proc):
+    if stop_key:
+        _LIVE_AGENT_PROCS[stop_key] = proc
+
+
+def _unregister_agent_proc(stop_key):
+    if stop_key:
+        _LIVE_AGENT_PROCS.pop(stop_key, None)
+
+
+def _sweep_live_agent_procs():
+    """Kill any still-registered agent tree at interpreter shutdown.
+
+    The streams run in daemon threads, so on a hard app exit their generator
+    ``finally`` blocks never run — without this sweep an in-flight agent CLI
+    (and its tool children) would survive the server and keep running.
+    """
+    for stop_key in list(_LIVE_AGENT_PROCS):
+        kill_agent_proc(stop_key)
+
+
+atexit.register(_sweep_live_agent_procs)
+
+
+def _kill_agent_tree(proc):
+    """Kill ``proc`` and its whole process group; never raise.
+
+    The agent CLIs run behind children of their own — hardened mode wraps the
+    CLI in ``sandbox-exec``, and the agents spawn tool subprocesses — and
+    every one of them inherits the stdout pipe. Killing ``proc`` alone would
+    leave a surviving child holding the pipe open, so the generator's blocked
+    stdout read never sees EOF and ⏹ Stop never lands. The Popen calls below
+    use ``start_new_session=True`` (pgid == pid), so one killpg reaches the
+    whole tree. The plain ``proc.kill()`` fallback covers fakes in tests
+    (no ``pid``) and platforms without process groups.
+    """
+    pid = getattr(proc, "pid", None)
+    if pid is not None and hasattr(os, "killpg"):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass  # group already gone — the direct kill below still runs
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def kill_agent_proc(stop_key):
+    """Kill the live agent process tree registered under ``stop_key``.
+
+    Returns True when a live process was found and killed; False when the
+    token is None/unknown (already finished, or a plain-API stream that has
+    no subprocess). Killing the process group closes the generator's blocked
+    stdout read, so a wedged stream ends immediately instead of at its
+    network timeout; the generator's own ``finally`` still runs its normal
+    cleanup (drainer join, Seatbelt profile unlink).
+    """
+    if not stop_key:
+        return False
+    proc = _LIVE_AGENT_PROCS.pop(stop_key, None)
+    if proc is None:
+        return False
+    _kill_agent_tree(proc)
+    return True
+
+
 def opencode_chat_stream(
     prompt,
     *,
@@ -1076,6 +1179,7 @@ def opencode_chat_stream(
     instruction=None,
     hardened=False,
     timeout=REQUEST_TIMEOUT,
+    stop_key=None,
 ):
     """Run ``opencode run --format json --auto`` and stream assistant text.
 
@@ -1136,8 +1240,7 @@ def opencode_chat_stream(
     profile_path = None
     if hardened and sandbox.seatbelt_available():
         try:
-            profile_path = sandbox.write_seatbelt_profile(workdir or ".")
-            args = ["sandbox-exec", "-f", profile_path] + args
+            args, profile_path = _seatbelt_wrap(args, workdir)
         except OSError:
             profile_path = None  # degrade to unconfined rather than fail
 
@@ -1148,6 +1251,9 @@ def opencode_chat_stream(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,  # line-buffered so yielded lines arrive as produced
+            # Own process group, so a Stop's killpg reaches the whole tree
+            # (sandbox-exec's grandchild CLI, the agents' tool children).
+            start_new_session=True,
         )
     except FileNotFoundError as e:
         raise RuntimeError(
@@ -1168,6 +1274,9 @@ def opencode_chat_stream(
 
     drainer = threading.Thread(target=_drain_stderr, daemon=True)
     drainer.start()
+    # Publish the live Popen so a Stop can kill it even while this generator
+    # is blocked reading stdout.
+    _register_agent_proc(stop_key, proc)
 
     try:
         assert proc.stdout is not None
@@ -1205,10 +1314,8 @@ def opencode_chat_stream(
                 raise RuntimeError(f"opencode error: {msg}")
         proc.wait(timeout=timeout)
     finally:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        _unregister_agent_proc(stop_key)
+        _kill_agent_tree(proc)
         drainer.join(timeout=5)
         if profile_path:
             _unlink_quietly(profile_path)
@@ -1280,6 +1387,7 @@ def cline_chat_stream(
     instruction=None,
     hardened=False,
     timeout=REQUEST_TIMEOUT,
+    stop_key=None,
 ):
     """Run ``cline --json`` and stream assistant text.
 
@@ -1348,8 +1456,7 @@ def cline_chat_stream(
     profile_path = None
     if hardened and sandbox.seatbelt_available():
         try:
-            profile_path = sandbox.write_seatbelt_profile(workdir or ".")
-            args = ["sandbox-exec", "-f", profile_path] + args
+            args, profile_path = _seatbelt_wrap(args, workdir)
         except OSError:
             profile_path = None  # degrade to unconfined rather than fail
 
@@ -1360,6 +1467,9 @@ def cline_chat_stream(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,  # line-buffered so yielded lines arrive as produced
+            # Own process group, so a Stop's killpg reaches the whole tree
+            # (sandbox-exec's grandchild CLI, the agents' tool children).
+            start_new_session=True,
         )
     except FileNotFoundError as e:
         raise RuntimeError(
@@ -1380,6 +1490,9 @@ def cline_chat_stream(
 
     drainer = threading.Thread(target=_drain_stderr, daemon=True)
     drainer.start()
+    # Publish the live Popen so a Stop can kill it even while this generator
+    # is blocked reading stdout.
+    _register_agent_proc(stop_key, proc)
 
     finish_reason = None  # run_result.finishReason ("completed"/"error"/…)
     finish_text = ""      # run_result.text (the error message on failures)
@@ -1431,10 +1544,8 @@ def cline_chat_stream(
                     yield f"\n\n_🔧 {tool}{suffix}_\n\n"
         proc.wait(timeout=timeout)
     finally:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        _unregister_agent_proc(stop_key)
+        _kill_agent_tree(proc)
         drainer.join(timeout=5)
         if profile_path:
             _unlink_quietly(profile_path)
@@ -1620,6 +1731,7 @@ def zcode_chat_stream(
     instruction=None,
     hardened=False,
     timeout=REQUEST_TIMEOUT,
+    stop_key=None,
 ):
     """Run ``zcode --prompt=<text> --json`` and yield the assistant reply.
 
@@ -1677,8 +1789,7 @@ def zcode_chat_stream(
     profile_path = None
     if hardened and sandbox.seatbelt_available():
         try:
-            profile_path = sandbox.write_seatbelt_profile(workdir or ".")
-            args = ["sandbox-exec", "-f", profile_path] + args
+            args, profile_path = _seatbelt_wrap(args, workdir)
         except OSError:
             profile_path = None  # degrade to unconfined rather than fail
 
@@ -1689,6 +1800,9 @@ def zcode_chat_stream(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=-1,  # one pretty-printed JSON object, not NDJSON
+            # Own process group, so a Stop's killpg reaches the whole tree
+            # (sandbox-exec's grandchild CLI, the agents' tool children).
+            start_new_session=True,
         )
     except FileNotFoundError as e:
         if profile_path:
@@ -1713,6 +1827,9 @@ def zcode_chat_stream(
 
     drainer = threading.Thread(target=_drain_stderr, daemon=True)
     drainer.start()
+    # Publish the live Popen so a Stop can kill it even while this generator
+    # is blocked reading stdout.
+    _register_agent_proc(stop_key, proc)
 
     stdout_text = ""
     try:
@@ -1720,10 +1837,8 @@ def zcode_chat_stream(
         stdout_text = proc.stdout.read()
         proc.wait(timeout=timeout)
     finally:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        _unregister_agent_proc(stop_key)
+        _kill_agent_tree(proc)
         drainer.join(timeout=5)
         if profile_path:
             _unlink_quietly(profile_path)

@@ -77,9 +77,9 @@ from .core import get_core
 AGENT_PROVIDERS = ["OpenCode", "Cline", "ZCode"]
 API_PROVIDERS = ["OpenRouter", "Ollama", "OpenAI-compatible"]
 
-# The flat key's pre-separation default, kept as the fresh-session default so
-# the grouping changes no behavior beyond the UI.
-DEFAULT_PROVIDER = "OpenRouter"
+# Fresh-session default: the provider a brand-new panel opens on (OpenCode,
+# the first agent CLI). Existing sessions keep whatever they had selected.
+DEFAULT_PROVIDER = "OpenCode"
 
 _KIND_LABELS = {"agents": "Agent CLIs", "api": "API providers"}
 
@@ -132,7 +132,7 @@ def _current_llm_model(prefix=""):
     ``prefix`` selects which set of widget keys to read.
     """
     p = prefix
-    provider = st.session_state.get(f"{p}llm_provider", "OpenRouter")
+    provider = st.session_state.get(f"{p}llm_provider", DEFAULT_PROVIDER)
     if provider == "OpenRouter":
         sel = st.session_state.get(f"{p}llm_or_model_sel")
         if sel and sel != "(other — type below)":
