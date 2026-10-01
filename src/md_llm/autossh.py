@@ -26,6 +26,7 @@ builder) and :mod:`.core` (for settings persistence via the injected Core).
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import signal
 import socket
@@ -119,6 +120,22 @@ def _autossh_forward_spec(cfg):
     return f"{int(cfg['local_port'])}:{cfg['remote_host']}:{int(cfg['remote_port'])}"
 
 
+def _spec_match_pattern(spec):
+    """An ERE matching command lines that carry ``spec`` as a whole argv token.
+
+    ``pgrep -f``/``pkill -f`` match a substring of the full command line, so a
+    raw spec like ``8080:1:80`` would also hit any unrelated process whose
+    arguments merely contain that run of characters — a user-supplied
+    ``remote_host`` could widen a Stop into killing an innocent process.
+    Anchoring with spaces (or string edges) restricts matches to processes
+    actually carrying the spec as one argument (the daemonized
+    ``ssh ... -L <spec> ...`` pair); a different port or host no longer
+    collides. Used for both ``pgrep`` (status) and ``pkill`` (stop) so the two
+    always agree on what "this tunnel" is.
+    """
+    return f"(^| ){re.escape(spec)}( |$)"
+
+
 def _autossh_env(cfg):
     env = dict(os.environ)
     env["AUTOSSH_GATETIME"] = str(int(cfg.get("gatetime", 0)))
@@ -133,7 +150,10 @@ def _tunnel_pids(spec):
     only way to tell whether the tunnel is still alive.
     """
     try:
-        r = subprocess.run(["pgrep", "-f", spec], capture_output=True, text=True)
+        r = subprocess.run(
+            ["pgrep", "-f", _spec_match_pattern(spec)],
+            capture_output=True, text=True,
+        )
     except OSError:
         return []
     return [int(tok) for tok in r.stdout.split() if tok.strip().isdigit()]
@@ -221,7 +241,7 @@ def _stderr_tail(path, limit=400):
             text = f.read()
     except OSError:
         return ""
-    lines = [l for l in text.strip().splitlines() if l.strip()]
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
     return "\n".join(lines[-4:])[-limit:]
 
 
@@ -245,7 +265,9 @@ def _stop_autossh(prefix, cfg):
         specs.append(started)
     for spec in specs:
         try:
-            subprocess.run(["pkill", "-f", spec], check=False)
+            subprocess.run(
+                ["pkill", "-f", _spec_match_pattern(spec)], check=False
+            )
         except OSError:
             pass
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 
 
 
@@ -83,23 +84,38 @@ def _read_text(path):
 def _write_text(path, text):
     """Atomically write ``text`` to ``path`` as UTF-8. True on success.
 
-    The content lands via a temp file in the target's directory plus
-    ``os.replace`` (the same pattern ``core.Core.save_settings`` uses), so a
-    crash mid-write can never leave a truncated document behind. Never creates
-    missing directories — editing overwrites an existing file or fails. Returns
-    False (instead of raising) for missing dirs, permission problems, and the
-    like; callers surface a UI error.
+    The content lands via a ``tempfile.mkstemp`` file in the target's
+    directory plus ``os.replace`` (the pattern ``llm._write_json_atomic``
+    uses), so a crash mid-write can never leave a truncated document behind
+    and the unpredictable temp name is not a symlink-attack target the way a
+    ``.<name>.<pid>.tmp`` guess would be in a shared-writable directory.
+    Never creates missing directories — editing overwrites an existing file
+    or fails. An existing file keeps its permission bits; a new one is
+    owner-only (mkstemp's 0600). Returns False (instead of raising) for
+    missing dirs, permission problems, and the like; callers surface a UI
+    error.
     """
     if not path:
         return False
     try:
         directory = os.path.dirname(os.path.abspath(path))
-        tmp = os.path.join(
-            directory, f".{os.path.basename(path)}.{os.getpid()}.tmp"
+        fd, tmp = tempfile.mkstemp(
+            dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
         )
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            try:
+                os.chmod(tmp, os.stat(path).st_mode & 0o777)
+            except OSError:
+                pass  # new file: keep mkstemp's owner-only 0600
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return True
     except OSError:
         return False

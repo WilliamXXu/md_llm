@@ -65,6 +65,19 @@ class WriteTextTests(unittest.TestCase):
         leftovers = [f for f in os.listdir(self.tmp) if f != "doc.md"]
         self.assertEqual(leftovers, [])
 
+    def test_existing_file_keeps_its_mode(self):
+        state._write_text(self.path, "first")
+        os.chmod(self.path, 0o640)
+        self.assertTrue(state._write_text(self.path, "second"))
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o640)
+        self.assertEqual(state._read_text(self.path), "second")
+
+    def test_new_file_is_owner_only(self):
+        """mkstemp's temp file is not a predictable symlink target, and the
+        0600 it lands with carries over to the new document."""
+        self.assertTrue(state._write_text(self.path, "x"))
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
 
 class DocEditDirtyTests(unittest.TestCase):
     """_doc_edit_dirty needs a Core so the path guard can resolve ``rel``."""
@@ -631,6 +644,63 @@ class BlockEditAppTests(_HostAppTest):
         )
         with self.assertRaises(KeyError):
             self.at.text_area(key="_reader_edit_block_area")
+
+
+class ResolveTargetGuardTests(unittest.TestCase):
+    """The read/write path guard must resolve symlinks, not just normalize.
+
+    The same guard gates opening (read) and the editor's save (write through
+    ``state._write_text`` → ``os.replace``), so a symlink that sneaks past it
+    is both an arbitrary-read and an arbitrary-overwrite hole.
+    """
+
+    def setUp(self):
+        _clear_edit_state()
+        self.tmp = tempfile.mkdtemp()
+        self.allowed = os.path.join(self.tmp, "allowed")
+        os.makedirs(self.allowed)
+        _reset_for_tests(Core(
+            base_dir=self.tmp,
+            markdown_dirs=(self.allowed,),
+            chat_save_dir=self.tmp,
+        ))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        _reset_for_tests()
+        _clear_edit_state()
+
+    def test_path_inside_allowed_dir_is_accepted(self):
+        target = reader._resolve_reader_target("allowed/notes.md")
+        self.assertEqual(target, os.path.join(self.allowed, "notes.md"))
+
+    def test_dotdot_escape_is_rejected(self):
+        self.assertIsNone(reader._resolve_reader_target("../outside.md"))
+
+    def test_symlink_to_outside_is_rejected(self):
+        """Regression: the guard used abspath, which normalizes lexically and
+        never resolves symlinks, so ``allowed/link.md`` -> outside passed the
+        check and read (or overwrote) the outside file."""
+        with open(os.path.join(self.tmp, "secret.txt"), "w") as f:
+            f.write("SECRET")
+        os.symlink(
+            os.path.join(self.tmp, "secret.txt"),
+            os.path.join(self.allowed, "link.md"),
+        )
+        self.assertIsNone(reader._resolve_reader_target("allowed/link.md"))
+
+    def test_symlink_within_allowed_dir_is_accepted(self):
+        os.symlink(
+            os.path.join(self.allowed, "real.md"),
+            os.path.join(self.allowed, "alias.md"),
+        )
+        self.assertIsNotNone(reader._resolve_reader_target("allowed/alias.md"))
+
+    def test_missing_target_under_symlinked_parent_is_rejected(self):
+        """realpath resolves the existing parent chain of a not-yet-created
+        save target, so an escape cannot wait behind a file creation."""
+        os.symlink(self.tmp, os.path.join(self.allowed, "up"))
+        self.assertIsNone(reader._resolve_reader_target("allowed/up/x.md"))
 
 
 if __name__ == "__main__":

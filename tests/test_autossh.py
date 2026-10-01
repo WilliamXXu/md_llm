@@ -10,6 +10,7 @@ render also smoke-tests the full panel including seed-on-first-run.
 """
 
 import os
+import re
 import signal
 import tempfile
 import unittest
@@ -283,12 +284,44 @@ class StopHandlerTests(AutosshTestCase):
             autossh._handle_stop(_cfg(local_port=9999), "chat_")
         pkill_specs = [c.args[0][2] for c in run.call_args_list
                        if c.args and c.args[0][0] == "pkill"]
-        self.assertIn("9999:localhost:11434", pkill_specs)  # current fields
-        self.assertIn("8181:localhost:8181", pkill_specs)   # started spec
+        # The pkill argument is the token-anchored ERE, not the raw spec.
+        self.assertIn(autossh._spec_match_pattern("9999:localhost:11434"),
+                      pkill_specs)  # current fields
+        self.assertIn(autossh._spec_match_pattern("8181:localhost:8181"),
+                      pkill_specs)  # started spec
         self.assertNotIn(autossh._autossh_spec_key("chat_"), st.session_state)
         level, text = st.session_state[autossh._autossh_msg_key("chat_")]
         self.assertEqual(level, "info")
         self.assertIn("Tunnel stopped", text)
+
+
+class SpecMatchPatternTests(unittest.TestCase):
+    """The pgrep/pkill pattern must anchor the spec as a whole argv token."""
+
+    def _matches(self, spec, cmdline):
+        return re.search(autossh._spec_match_pattern(spec), cmdline) is not None
+
+    def test_matches_the_daemonized_tunnel_command_line(self):
+        spec = "8080:localhost:11434"
+        self.assertTrue(self._matches(
+            spec, "ssh -N -L 8080:localhost:11434 -i key user@host"))
+        self.assertTrue(self._matches(
+            spec, "autossh -M 0 -fN -L 8080:localhost:11434 host"))
+
+    def test_does_not_match_look_alike_command_lines(self):
+        spec = "8080:1:80"
+        # Substring matches the old raw-spec pgrep would have killed.
+        self.assertFalse(self._matches(
+            spec, "ssh -N -L 8080:1:8080 -i key user@host"))
+        self.assertFalse(self._matches(
+            spec, "sleep 18080:1:80"))
+        self.assertFalse(self._matches(
+            spec, "echo 18080:1:80 extra"))
+
+    def test_regex_metacharacters_in_host_are_literal(self):
+        spec = "8080:a.b+1:80"  # a hostile/weird remote_host
+        self.assertTrue(self._matches(spec, f"ssh -L {spec} host"))
+        self.assertFalse(self._matches(spec, "ssh -L 8080:aXb+1:80 host"))
 
     def test_stop_reports_port_still_open(self):
         with mock.patch.object(autossh, "_STOP_TIMEOUT_S", 0.3), \

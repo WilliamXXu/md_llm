@@ -74,7 +74,14 @@ class Core:
             return dict(self._memory_store)
 
     def save_settings(self, settings: dict) -> None:
-        """Atomically write settings, or hold them in memory when no path is set."""
+        """Atomically write settings, or hold them in memory when no path is set.
+
+        The file lands owner-only (``0600``) when new — it stores provider API
+        keys in plaintext, and the plain ``open`` + ``os.replace`` below would
+        otherwise inherit the process umask (typically ``0644``, world-readable
+        on shared machines). An existing file keeps its mode (the same policy
+        :func:`md_llm.llm._write_json_atomic` applies to the zcode config).
+        """
         if not isinstance(settings, dict):
             return
         p = self._resolved_settings_path()
@@ -86,6 +93,10 @@ class Core:
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(tmp, os.stat(p).st_mode & 0o777)
+            except OSError:
+                os.chmod(tmp, 0o600)
             os.replace(tmp, p)
         except OSError:
             # Persist best-effort; never crash a render over a settings write.

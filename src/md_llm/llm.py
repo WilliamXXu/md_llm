@@ -1,6 +1,6 @@
 """Lightweight LLM clients for post-processing transcripts (summarize, etc.).
 
-Five providers are supported:
+Six providers are supported:
   - Ollama: a local server reachable over HTTP (default).
   - OpenRouter: a hosted API keyed by OPENROUTER_API_KEY.
   - OpenAI: a generic OpenAI-compatible API keyed by OPENAI_API_KEY. Point
@@ -15,6 +15,10 @@ Five providers are supported:
     (`cline --json "prompt"`). Like OpenCode it runs tools (auto-approved) in a
     working directory; auth + model routing are Cline's own (`cline auth`), and
     the chat panel streams its NDJSON event output.
+  - ZCode: the Z.ai / BigModel coding AGENT CLI, also invoked as a subprocess
+    (`zcode --prompt=... --json`), streaming one final JSON result object.
+    Auth + model routing are ZCode's own (`zcode login` + its config, which
+    :func:`set_zcode_model` can rewrite — the switch is global).
 
 Uses only the standard library (urllib + json + subprocess) to match the
 no-extra-deps style of transcribe_local.py's remote-Whisper client.

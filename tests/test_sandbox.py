@@ -105,7 +105,7 @@ class SandboxTests(unittest.TestCase):
         # Last-match-wins ordering: the sandbox re-allow must come AFTER the
         # blanket read deny that includes the host tree.
         self.assertLess(profile.index("(deny file-read*"),
-                        profile.rindex(f'(allow file-read* (subpath "/tmp/wk/a-b1234")'))
+                        profile.rindex('(allow file-read* (subpath "/tmp/wk/a-b1234")'))
         self.assertIn("(allow network*)", profile)
 
     def test_profile_reallows_cline_state_dir(self):
@@ -143,6 +143,45 @@ class SandboxTests(unittest.TestCase):
                 self.assertEqual(f.read(), sandbox.seatbelt_profile("/tmp/wk/x-1"))
         finally:
             os.unlink(path)
+
+    # --- adversarial workdir (profile-injection regression) ------------------
+
+    def test_profile_rejects_workdir_with_quote(self):
+        """A ``"`` in the workdir breaks out of the ``(subpath "...")`` literal
+        and everything after it is parsed as profile rules — with Seatbelt's
+        last-match-wins ordering an injected ``(allow ...)`` re-opens the
+        trees the blanket read-deny just closed. The guard must fail closed
+        (raise), never render a widened profile."""
+        evil = (
+            '/tmp/evil" (allow file-read* (subpath "'
+            + os.path.expanduser("~")
+            + '")) "'
+        )
+        with self.assertRaises(ValueError):
+            sandbox.seatbelt_profile(evil)
+
+    def test_profile_rejects_workdir_with_backslash(self):
+        with self.assertRaises(ValueError):
+            sandbox.seatbelt_profile("/tmp/ev\\il")
+
+    def test_profile_rejects_hostile_name_reached_via_symlink(self):
+        """abspath itself may look clean; realpath of the same workdir lands
+        on the hostile name — both must be checked."""
+        target = os.path.join(self.tmp, 'ev"il')
+        os.makedirs(target)
+        link = os.path.join(self.tmp, "link")
+        os.symlink(target, link)
+        with self.assertRaises(ValueError):
+            sandbox.seatbelt_profile(link)
+
+    def test_write_seatbelt_profile_propagates_rejection_without_leaving_a_file(self):
+        before = set(os.listdir(tempfile.gettempdir()))
+        with self.assertRaises(ValueError):
+            sandbox.write_seatbelt_profile('/tmp/ev"il')
+        after = set(os.listdir(tempfile.gettempdir()))
+        self.assertEqual(
+            [n for n in after - before if n.startswith("md_llm_seatbelt_")], []
+        )
 
 
 if __name__ == "__main__":

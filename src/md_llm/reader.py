@@ -314,17 +314,30 @@ def _resolve_reader_target(rel):
     """Resolve the relpath to a safe absolute path, or None.
 
     Only paths that land inside one of ``core.markdown_dirs`` are accepted, so a
-    crafted value can never read outside the host's own data dirs. Returns None
-    (and surfaces an error) when the target is rejected or missing.
+    crafted value can never read outside the host's own data dirs. Both sides
+    are resolved with ``os.path.realpath`` before the containment check —
+    ``abspath`` normalizes lexically only, so a symlink inside an allowed dir
+    would otherwise pass the guard while reading (or, via the editor's save,
+    writing) outside it. ``realpath`` also resolves the existing parent chain
+    of a not-yet-created save target, so its check is identical once the file
+    exists. Returns None (and surfaces an error) when the target is rejected
+    or missing.
     """
     if not rel:
         return None
     base = os.path.abspath(get_core().base_dir)
     target = os.path.abspath(os.path.join(base, rel))
-    allowed = tuple(os.path.abspath(d) for d in get_core().markdown_dirs)
-    inside = any(
-        os.path.commonpath([target, root]) == root for root in allowed
-    )
+    allowed = tuple(os.path.realpath(d) for d in get_core().markdown_dirs)
+    try:
+        inside = any(
+            os.path.commonpath([os.path.realpath(target), root]) == root
+            for root in allowed
+        )
+    except ValueError:
+        # commonpath refuses mixed absolute/relative inputs; markdown_dirs is
+        # host-supplied, so fail closed (refuse) instead of letting a render
+        # crash on a misconfigured root.
+        inside = False
     if not inside:
         st.error("Refusing to open a path outside the configured document dirs.")
         return None

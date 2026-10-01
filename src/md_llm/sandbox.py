@@ -221,8 +221,36 @@ _PROFILE_TEMPLATE = """\
 """
 
 
+def _validate_profile_workdir(workdir):
+    """Reject workdir paths that could corrupt the SBPL profile's syntax.
+
+    SBPL has no string escaping: a ``"`` in the path terminates the
+    ``(subpath "...")`` literal early and everything after it is parsed as
+    profile *rules* — and because Seatbelt rules are last-match-wins, an
+    injected ``(allow ...)`` would re-open trees the blanket denies above
+    just closed. Backslashes are rejected too (no legitimate macOS path
+    needs one). Fails closed on purpose: callers must refuse the run rather
+    than start it unconfined or with a weakened profile.
+
+    Raises :class:`ValueError` naming the problem (surfaced to the user via
+    the chat stream's error holder).
+    """
+    for candidate in (os.path.abspath(workdir), os.path.realpath(workdir)):
+        if '"' in candidate or "\\" in candidate:
+            raise ValueError(
+                f"Refusing to sandbox workdir {workdir!r}: the path contains "
+                'a quote or backslash, which would let it inject rules into '
+                "the Seatbelt profile. Pick a workdir without those "
+                "characters."
+            )
+
+
 def seatbelt_profile(workdir):
     """Render the SBPL profile confining an agent run to ``workdir``.
+
+    Raises :class:`ValueError` when ``workdir`` carries characters that could
+    inject profile rules (see :func:`_validate_profile_workdir`) — never
+    renders a widened profile.
 
     Writes land only in the workdir plus the per-user macOS temp/cache tree
     (/var/folders, where TMPDIR and ~/Library/Caches live), the agents' own
@@ -240,6 +268,7 @@ def seatbelt_profile(workdir):
     or exfiltrated from it.
     """
     home = os.path.expanduser("~")
+    _validate_profile_workdir(workdir)
     return _PROFILE_TEMPLATE.format(
         sandbox=os.path.abspath(workdir).rstrip("/") or "/",
         home=home,
@@ -253,9 +282,12 @@ def write_seatbelt_profile(workdir):
     """Write :func:`seatbelt_profile` to a private temp file; return its path.
 
     The caller deletes the file when the run ends (opencode_chat_stream does
-    this in its finally block).
+    this in its finally block). Validation happens before the temp file is
+    created, so a rejected workdir raises :class:`ValueError` without leaving
+    a stray profile file behind.
     """
+    profile = seatbelt_profile(workdir)
     fd, path = tempfile.mkstemp(prefix="md_llm_seatbelt_", suffix=".sb")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(seatbelt_profile(workdir))
+        f.write(profile)
     return path
