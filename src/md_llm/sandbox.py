@@ -14,8 +14,10 @@ user can. This module turns that soft cwd-scoping into an OS-enforced sandbox:
   directories are garbage-collected by age (:data:`STALE_AFTER_S`) whenever a
   new one is created (after use). ``clear_sandbox`` wipes one immediately.
 - **No leakage from host folders**: the generated Seatbelt profile denies file
-  *reads* of everything under core.base_dir (transcripts, chat history,
-  settings), of credential stores (~/.ssh, ~/.gnupg, ...), and of the classic
+  *reads* of everything under core.base_dir (transcripts, chat history), of
+  the host settings file itself (it stores provider API keys in plaintext and
+  normally sits beside — not under — base_dir), of credential stores
+  (~/.ssh, ~/.gnupg, ...), and of the classic
   personal-data trees (Desktop/Documents/Downloads, media folders, Mail,
   Messages, browser profiles, iCloud Drive). It denies file *writes* everywhere
   except the session sandbox plus scratch space macOS and opencode legitimately
@@ -217,12 +219,17 @@ _PROFILE_TEMPLATE = """\
    (subpath "{home}/.zcode"))
 (allow file-read* (subpath "{sandbox}"))
 
-(allow network*)
+;; The host's settings file stores provider API keys in plaintext and is
+;; normally a SIBLING of base_dir (e.g. ~/.md_llm/_md_llm_settings.json next
+;; to uploads/), so the base_dir deny above doesn't cover it: it gets its own
+;; deny, emitted after every allow so last-match-wins keeps it closed. The
+;; .tmp literal covers the atomic-save staging name.
+{settings_deny}(allow network*)
 """
 
 
-def _validate_profile_workdir(workdir):
-    """Reject workdir paths that could corrupt the SBPL profile's syntax.
+def _reject_profile_unsafe_literal(path, what):
+    """Reject paths that could corrupt the SBPL profile's syntax.
 
     SBPL has no string escaping: a ``"`` in the path terminates the
     ``(subpath "...")`` literal early and everything after it is parsed as
@@ -232,17 +239,30 @@ def _validate_profile_workdir(workdir):
     needs one). Fails closed on purpose: callers must refuse the run rather
     than start it unconfined or with a weakened profile.
 
+    ``what`` names the path's role in the error message ("workdir",
+    "settings path", ...). Raises :class:`ValueError` (surfaced to the user
+    via the chat stream's error holder).
+    """
+    for candidate in (os.path.abspath(path), os.path.realpath(path)):
+        if '"' in candidate or "\\" in candidate:
+            raise ValueError(
+                f"Refusing to sandbox with {what} {path!r}: the path "
+                'contains a quote or backslash, which would let it inject '
+                "rules into the Seatbelt profile. Pick a path without "
+                "those characters."
+            )
+
+
+def _validate_profile_workdir(workdir):
+    """Reject workdir paths that could corrupt the SBPL profile's syntax.
+
+    See :func:`_reject_profile_unsafe_literal` — the same fail-closed rule
+    applies to every path this module interpolates into a profile literal.
+
     Raises :class:`ValueError` naming the problem (surfaced to the user via
     the chat stream's error holder).
     """
-    for candidate in (os.path.abspath(workdir), os.path.realpath(workdir)):
-        if '"' in candidate or "\\" in candidate:
-            raise ValueError(
-                f"Refusing to sandbox workdir {workdir!r}: the path contains "
-                'a quote or backslash, which would let it inject rules into '
-                "the Seatbelt profile. Pick a workdir without those "
-                "characters."
-            )
+    _reject_profile_unsafe_literal(workdir, "workdir")
 
 
 def seatbelt_profile(workdir):
@@ -255,8 +275,11 @@ def seatbelt_profile(workdir):
     Writes land only in the workdir plus the per-user macOS temp/cache tree
     (/var/folders, where TMPDIR and ~/Library/Caches live), the agents' own
     state directories (opencode's dot-dirs, cline's ~/.cline), /tmp and
-    /dev/null; reads are denied for the host's data tree (core.base_dir),
-    typical credential stores, and personal-data folders (Desktop, Documents,
+    /dev/null; reads are denied for the host's data tree (core.base_dir), the
+    host's settings file and its atomic-save .tmp companion (it stores
+    provider API keys in plaintext and normally sits beside — not under —
+    base_dir, so it gets its own deny after every allow), typical credential
+    stores, and personal-data folders (Desktop, Documents,
     Downloads, media, Mail/Messages, browser profiles, iCloud Drive), then
     re-allowed for the workdir itself and for the agents' own runtime dirs
     (Seatbelt rules apply last-match-wins). The narrow base_dir deny (instead
@@ -269,10 +292,32 @@ def seatbelt_profile(workdir):
     """
     home = os.path.expanduser("~")
     _validate_profile_workdir(workdir)
+    sandbox_path = os.path.abspath(workdir).rstrip("/") or "/"
+    if sandbox_path in ("/", home):
+        # "/" — or the home directory, where every denied tree lives — is
+        # undone by the profile's own trailing allows (last-match-wins): the
+        # write allow re-permits everything and the final read re-allow
+        # overrides every deny. That is a no-op profile presented as
+        # Hardened, so fail closed instead.
+        raise ValueError(
+            f"Refusing to sandbox workdir {workdir!r}: confining the agent "
+            "to the whole drive or the home directory would re-allow every "
+            "path the profile denies. Pick a project directory instead."
+        )
+    settings_deny = ""
+    settings = get_core()._resolved_settings_path()
+    if settings:
+        _reject_profile_unsafe_literal(settings, "settings path")
+        real = os.path.realpath(settings)
+        settings_deny = (
+            f'(deny file-read* (subpath "{real}"))\n'
+            f'(deny file-read* (literal "{real}.tmp"))\n'
+        )
     return _PROFILE_TEMPLATE.format(
-        sandbox=os.path.abspath(workdir).rstrip("/") or "/",
+        sandbox=sandbox_path,
         home=home,
         base_dir=os.path.abspath(get_core().base_dir),
+        settings_deny=settings_deny,
         # Keep host_root for backwards-compat if template still references it
         host_root=os.path.dirname(os.path.abspath(get_core().base_dir)),
     )
@@ -288,6 +333,15 @@ def write_seatbelt_profile(workdir):
     """
     profile = seatbelt_profile(workdir)
     fd, path = tempfile.mkstemp(prefix="md_llm_seatbelt_", suffix=".sb")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(profile)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(profile)
+    except BaseException:
+        # A half-written profile is never valid input for sandbox-exec —
+        # don't leave it behind for the next run to trip over.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
     return path

@@ -111,6 +111,20 @@ class StageNewUploadsTests(unittest.TestCase):
         app._stage_new_uploads([up])
         self.assertEqual(docs.open_documents(), ["notes.md"])
 
+    def test_traversal_name_stages_the_bare_basename(self):
+        """The multipart file name is client-controlled and Streamlit does not
+        sanitize it server-side, so staging must reduce it to a basename: a
+        crafted "../x" name must never write (or open) outside the staging
+        dir — ../evil.md resolves next to _UPLOADS_DIR."""
+        up = _FakeUpload("../evil.md", "fid-trav")
+        app._stage_new_uploads([up])
+        self.assertEqual(docs.open_documents(), ["evil.md"])
+        self.assertEqual((self._uploads / "evil.md").read_bytes(), b"content")
+        self.assertFalse((self._uploads.parent / "evil.md").exists())
+        self.assertEqual(
+            st.session_state[app._LAST_UPLOAD_KEY]["fid-trav"], "evil.md"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

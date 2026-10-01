@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -76,11 +77,13 @@ class Core:
     def save_settings(self, settings: dict) -> None:
         """Atomically write settings, or hold them in memory when no path is set.
 
-        The file lands owner-only (``0600``) when new — it stores provider API
-        keys in plaintext, and the plain ``open`` + ``os.replace`` below would
-        otherwise inherit the process umask (typically ``0644``, world-readable
-        on shared machines). An existing file keeps its mode (the same policy
-        :func:`md_llm.llm._write_json_atomic` applies to the zcode config).
+        The file lands owner-only (``0600``) on every save — it stores provider
+        API keys in plaintext, and clamping (rather than preserving the prior
+        mode) also heals settings files that pre-0600 versions wrote
+        world-readable. The temp file comes from ``tempfile.mkstemp``
+        (unpredictable name, created ``0600``) in the settings file's own
+        directory, so a pre-planted symlink at a predictable ``.tmp`` path
+        can't redirect the write.
         """
         if not isinstance(settings, dict):
             return
@@ -88,17 +91,25 @@ class Core:
         if not p:
             self._memory_store = dict(settings)
             return
-        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-        tmp = p + ".tmp"
+        dir_ = os.path.dirname(p) or "."
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(settings, f, ensure_ascii=False, indent=2)
+            os.makedirs(dir_, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                prefix=os.path.basename(p) + ".", suffix=".tmp", dir=dir_
+            )
             try:
-                os.chmod(tmp, os.stat(p).st_mode & 0o777)
-            except OSError:
-                os.chmod(tmp, 0o600)
-            os.replace(tmp, p)
-        except OSError:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(settings, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, p)
+            except BaseException:
+                # Never leave the half-written temp (with its key copies)
+                # behind, whatever went wrong.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except (OSError, TypeError, ValueError):
             # Persist best-effort; never crash a render over a settings write.
             self._memory_store = dict(settings)
 

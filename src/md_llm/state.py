@@ -71,14 +71,22 @@ def _human_size(nbytes):
 
 
 def _read_text(path):
-    """Read a file's text as UTF-8. Returns '' for missing/unreadable files."""
+    """Read a file's text as UTF-8.
+
+    Returns ``""`` for a missing path (the long-standing contract: chat
+    context sends treat a missing file as "no context") and for a genuinely
+    empty file. Returns ``None`` when the file EXISTS but cannot be read or
+    decoded (permission denied, non-UTF-8 bytes) — callers must not treat
+    None as ``""``: seeding an editor with an empty string for a file we
+    failed to read would let a subsequent Save truncate it to nothing.
+    """
     if not path or not os.path.isfile(path):
         return ""
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
-    except OSError:
-        return ""
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _write_text(path, text):

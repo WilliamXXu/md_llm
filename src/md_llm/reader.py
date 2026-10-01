@@ -300,12 +300,21 @@ def open_in_reader(relpath, keep_open=False):
     becomes the active one, each document keeping its own independent LLM
     chat. The default keeps today's single-document behaviour — any previously
     open documents are dropped and the session returns to the legacy keys.
+
+    Switching to a *different* target in single-document mode also drops the
+    legacy bare editor state (draft, lock, mtime baseline): it belongs to the
+    previous document, and carrying it over would render — and could save —
+    one file's unsaved edits under another document's title. Re-opening the
+    same target keeps its draft.
     """
+    previous = st.session_state.get(_READER_TARGET)
     if relpath:
         st.session_state[_READER_TARGET] = relpath
     if keep_open:
         docs.add_document(relpath)
     else:
+        if relpath and previous != relpath:
+            _pop_edit_state("")
         docs.reset_documents()
     st.session_state[TABS_KEY] = READER_TAB_LABEL
 
@@ -446,12 +455,18 @@ def _doc_edit_dirty(rel):
 
 
 def _pop_edit_state(rel):
-    """Drop every editor key of ``rel`` (draft, widget values, mtime, lock)."""
+    """Drop every editor key of ``rel`` (draft, widget values, mtime, lock).
+
+    The conflict-dialog stash (``_EDIT_PENDING``) is global by design — it
+    carries the draft across the rerun that shows the dialog — so it is
+    dropped bare regardless of ``rel``.
+    """
     for base in (
         _EDIT_DRAFT, _EDIT_AREA, _EDIT_AREA_GEN, _EDIT_BASE_MTIME,
-        _EDIT_UNLOCKED, _EDIT_BLOCK_INDEX, _EDIT_BLOCK_AREA,
+        _EDIT_UNLOCKED, _EDIT_LOCK_TOGGLE, _EDIT_BLOCK_INDEX, _EDIT_BLOCK_AREA,
     ):
         st.session_state.pop(docs.doc_key(base, rel), None)
+    st.session_state.pop(_EDIT_PENDING, None)
     _pop_raw_area_generations(rel)
 
 
@@ -707,6 +722,9 @@ def _commit_block_edit():
     if draft is None:
         target = _resolve_reader_target(st.session_state.get(_READER_TARGET))
         draft = _read_text(target) if target else ""
+        if draft is None:
+            # Unreadable target: there is no on-disk text to splice into.
+            return
     blocks, _refs = _md_blocks(draft)
     if index >= len(blocks):
         return
@@ -1030,7 +1048,8 @@ def render_toc():
     with st.container(key="_reader_toc_area"):
         st.subheader("Contents")
         st.markdown(f"<style>{_TOC_CSS}</style>", unsafe_allow_html=True)
-        entries = _toc_entries(_read_text(target))
+        # None (unreadable file) degrades to "no headings", not a crash.
+        entries = _toc_entries(_read_text(target) or "")
         if not entries:
             st.caption("_No headings in this document._")
             return
@@ -1177,6 +1196,20 @@ def render_reader():
         return
 
     text = _read_text(target)
+    if text is None:
+        # The file exists but can't be read/decoded: rendering an empty
+        # document would seed the editor with "" and let a Save truncate
+        # the file to nothing. Refuse the body (and the editor) instead,
+        # keeping the document closable.
+        st.error(
+            f"Could not read `{_display_name_for_filepath(target)}` — it is "
+            "not readable as UTF-8 text. The document body, editor, and "
+            "Save are disabled so the file cannot be overwritten with an "
+            "empty document."
+        )
+        st.button("Close", key="_reader_unreadable_close_btn",
+                  on_click=_close_reader)
+        return
     try:
         size = _human_size(os.path.getsize(target))
     except OSError:
@@ -1308,12 +1341,7 @@ def _close_reader():
         # In single-document mode the editor keys are the legacy bare keys —
         # dropped by name (multi-doc copies carry the __doc__ suffix and are
         # swept by remove_document above).
-        for base in (
-            _EDIT_DRAFT, _EDIT_AREA, _EDIT_AREA_GEN, _EDIT_BASE_MTIME,
-            _EDIT_UNLOCKED, _EDIT_BLOCK_INDEX, _EDIT_BLOCK_AREA,
-        ):
-            st.session_state.pop(base, None)
-        _pop_raw_area_generations("")
+        _pop_edit_state("")
         # In single-document mode, clear the staged quick prompt (legacy bare
         # key shared by every chat session of this now-closed document).
         for sid in docs.chat_sessions(""):

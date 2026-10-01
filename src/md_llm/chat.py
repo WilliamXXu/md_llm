@@ -289,7 +289,9 @@ def _render_chat_as_markdown(context_path, provider, model):
     ]
     # Embed the source text before the turns so the saved chat stands alone.
     if context_path:
-        source_text = _read_text(context_path)
+        # None (unreadable context file) degrades to "no context", as a
+        # missing one always has — never a crash on .strip().
+        source_text = _read_text(context_path) or ""
         if source_text.strip():
             lines.append("## Source document")
             lines.append("")
@@ -427,7 +429,9 @@ def _send_context_and_turns(context_path):
     """
     messages = []
     if context_path:
-        doc = _read_text(context_path)
+        # None (unreadable context file) degrades to "no context", as a
+        # missing one always has — never a crash on .strip().
+        doc = _read_text(context_path) or ""
         if doc.strip():
             messages.append({
                 "role": "user",
@@ -528,8 +532,9 @@ def _build_stream(context_path, holder, stop_key=None):
         entry = _oai_registry_entry(
             get_core().load_settings().get("llm") or {}, endpoint
         )
+        typed_key = st.session_state.get(f"{p}llm_oai_api_key") or ""
         api_key = (
-            st.session_state.get(f"{p}llm_oai_api_key")
+            typed_key
             or entry["api_key"]
             or os.environ.get("OPENAI_API_KEY", "")
         )
@@ -538,14 +543,23 @@ def _build_stream(context_path, holder, stop_key=None):
                 "No OpenAI-compatible API key. Paste one in the LLM controls "
                 "or set the OPENAI_API_KEY env var."
             )
-        # Persist this key + model paired with the endpoint in the shared
-        # registry, mirroring what a host's manual / autopilot panels do on run.
+        # Persist the model + endpoint pairing in the shared registry (mirrors
+        # what a host's manual / autopilot panels do on run) — but only a key
+        # typed THIS session reaches the disk: a key from the stored entry is
+        # already there, and an env-var fallback is never ours to persist
+        # (that would silently turn a session secret into one at rest).
         _remember_oai_endpoint(endpoint)
-        _save_oai_registry_entry(
-            endpoint, last_model=model, api_key=api_key,
-            pending_model_key="_pending_chat_oai_model_sel",
-            pending_api_key_key="_pending_chat_oai_api_key",
-        )
+        if typed_key:
+            _save_oai_registry_entry(
+                endpoint, last_model=model, api_key=typed_key,
+                pending_model_key="_pending_chat_oai_model_sel",
+                pending_api_key_key="_pending_chat_oai_api_key",
+            )
+        else:
+            _save_oai_registry_entry(
+                endpoint, last_model=model,
+                pending_model_key="_pending_chat_oai_model_sel",
+            )
         gen = llm.openai_chat_stream(
             turns, api_key=api_key, model=model, endpoint=endpoint,
             instruction=instruction,
@@ -1637,6 +1651,10 @@ def render_chat():
         "Close",
         disabled=len(sessions) <= 1,
     ):
+        # Same orphaning hazard as Clear: remove_chat drops this session's
+        # task key while the worker may still be streaming. Stop the stream
+        # (and kill any agent behind it) first.
+        _stop_streaming_reply()
         docs.remove_chat(cur, _doc)
         st.rerun()
 
@@ -1740,6 +1758,13 @@ def render_chat():
             # simply stays up until the next interaction.
             st.success(f"Conversation saved to `{saved}`")
     if col_clear.button("Clear conversation"):
+        # Wind down a live stream BEFORE its session keys are dropped: popping
+        # the task key orphans the worker — the reply is lost (that's the
+        # point of Clear) but an agent CLI behind it would keep auto-approving
+        # tool calls with no cancel path, since ⏹ Stop only reaches the
+        # ACTIVE session's task. This flags the stop and kills the agent
+        # process group (no-op when nothing is streaming).
+        _stop_streaming_reply()
         st.session_state.pop(_chat_state_key(_CHAT_MESSAGES), None)
         st.session_state.pop(_chat_state_key(_CHAT_BG_TASK), None)
         st.rerun()

@@ -1,9 +1,11 @@
 """Tests for on-disk settings persistence (``md_llm.core``).
 
 The settings file stores provider API keys in plaintext by design, so its
-permission bits are part of the contract: owner-only when created fresh
-(regardless of the process umask), preserved when the file already exists —
-the same policy ``llm._write_json_atomic`` applies to the zcode config.
+permission bits are part of the contract: owner-only (0600) on every save,
+regardless of the process umask AND of any mode an older version left behind —
+clamping on every save heals legacy world-readable files instead of preserving
+them. The temp file is a mkstemp (unpredictable name) and never survives a
+failed save.
 """
 
 import os
@@ -42,11 +44,25 @@ class SettingsFileModeTests(unittest.TestCase):
             os.umask(old)
         self.assertEqual(os.stat(self.settings).st_mode & 0o777, 0o600)
 
-    def test_existing_settings_file_keeps_its_mode(self):
+    def test_existing_world_readable_file_is_clamped_to_owner_only(self):
+        """Heals deployments written before the 0600-on-create fix: a legacy
+        0644 settings file must not stay world-readable — the file stores
+        plaintext API keys, so the clamp applies on every save."""
         self._core().save_settings({})
-        os.chmod(self.settings, 0o640)
+        os.chmod(self.settings, 0o644)
         self._core().save_settings({"llm": {}})
-        self.assertEqual(os.stat(self.settings).st_mode & 0o777, 0o640)
+        self.assertEqual(os.stat(self.settings).st_mode & 0o777, 0o600)
+
+    def test_unserializable_settings_leave_no_tmp_behind(self):
+        """json.dump raising TypeError is swallowed by the best-effort
+        contract — and must not strand a half-written key-bearing temp file."""
+        c = self._core()
+        c.save_settings({"llm": {(("tuple-key",),): "x"}})
+        self.assertEqual(os.listdir(self.tmp), [])
+        # The settings survive in the in-memory fallback store.
+        self.assertEqual(
+            c.load_settings(), {"llm": {(("tuple-key",),): "x"}}
+        )
 
     def test_written_settings_round_trip(self):
         c = self._core()

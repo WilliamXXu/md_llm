@@ -917,6 +917,37 @@ def _zcode_cached_model_refs():
     return list(cache)
 
 
+def _on_zcode_model_change(prefix):
+    """on_change for the ZCode model selectbox: apply a genuine user pick.
+
+    Callbacks run at the top of the rerun, BEFORE widgets mount — so both the
+    config write and the error-path reset of the selectbox's session key are
+    legal here. (The old inline apply block did that reset in the render body,
+    after the widget had instantiated — exactly the case Streamlit rejects
+    with StreamlitAPIException, so the friendly error path itself crashed.)
+    Firing only on genuine user changes is also what stops the panel from
+    fighting the world: an out-of-band ``/model`` switch in another zcode
+    session, or another mounted panel's pick, never triggers this callback,
+    so nothing gets "reverted" on later renders.
+    """
+    p = prefix
+    sel_key = f"{p}llm_zcode_model_sel"
+    picked = st.session_state.get(sel_key)
+    if not picked or picked == ZCODE_CURRENT_MODEL_LABEL:
+        return
+    try:
+        llm.set_zcode_model(picked)
+    except (ValueError, RuntimeError) as e:
+        # Stage the error for the render body (deltas from a callback are
+        # unreliable) and snap the display back to the real config.
+        st.session_state[f"{p}llm_zcode_apply_error"] = str(e)
+        st.session_state[sel_key] = llm.read_zcode_model() or (
+            ZCODE_CURRENT_MODEL_LABEL
+        )
+        return
+    st.toast(f"ZCode model switched globally: {picked}", icon="✅")
+
+
 def _render_zcode_controls(prefix, saved_llm):
     """Render the ZCode provider's model / sandbox controls.
 
@@ -935,11 +966,18 @@ def _render_zcode_controls(prefix, saved_llm):
     options = [ZCODE_CURRENT_MODEL_LABEL] + list(discovered)
     if current and current not in options:
         options.append(current)
+    # Pre-mount selection reconcile (legal here: no widget is mounted yet).
+    # The dropdown DISPLAYS the configured ref — ZCode's config is the source
+    # of truth — so a concrete selection differing from it is stale (a
+    # restored control snapshot, an out-of-band /model change in another
+    # zcode session, another mounted panel's pick) and snaps back to the
+    # config. Picks are applied ONLY by the on_change callback below, which
+    # fires on genuine user changes and has already made config == selection
+    # by the time this body runs — so this reconcile can never revert a
+    # choice made in this panel (the old inline apply block did exactly that,
+    # on every render, forever).
     sel = st.session_state.get(f"{p}llm_zcode_model_sel")
-    if sel not in options:
-        # Fresh mount or a stale selection (the config changed out-of-band):
-        # a concrete selection that differs from the freshly-read config is
-        # stale by construction, so fall back to the configured ref.
+    if sel != ZCODE_CURRENT_MODEL_LABEL and sel != current:
         st.session_state[f"{p}llm_zcode_model_sel"] = current or (
             ZCODE_CURRENT_MODEL_LABEL
         )
@@ -949,6 +987,8 @@ def _render_zcode_controls(prefix, saved_llm):
         "Model (switches ZCode globally)",
         options,
         key=f"{p}llm_zcode_model_sel",
+        on_change=_on_zcode_model_change,
+        args=(prefix,),
         help=(
             "Every model declared in ZCode's own config "
             "(~/.zcode/cli/config.json), plus the currently configured one. "
@@ -962,22 +1002,12 @@ def _render_zcode_controls(prefix, saved_llm):
         st.session_state.pop(_ZCODE_MODEL_REFS_CACHE_KEY, None)
         st.rerun()
 
-    # Apply the pick: rewrite ZCode's config (global). Runs on the rerun the
-    # pick triggers; a concrete selection equal to the configured ref is a
-    # no-op, and a failed write resets the dropdown to the real config.
-    picked = st.session_state.get(f"{p}llm_zcode_model_sel")
-    if (
-        picked
-        and picked not in (ZCODE_CURRENT_MODEL_LABEL, current)
-    ):
-        try:
-            llm.set_zcode_model(picked)
-            st.toast(f"ZCode model switched globally: {picked}", icon="✅")
-        except (ValueError, RuntimeError) as e:
-            st.error(f"Could not switch the ZCode model: {e}")
-            st.session_state[f"{p}llm_zcode_model_sel"] = current or (
-                ZCODE_CURRENT_MODEL_LABEL
-            )
+    # Surface an apply failure the callback staged: its error-path reset of
+    # the selectbox's session key is only legal BEFORE the widget mounts —
+    # i.e. in the callback — so the message travels through session state.
+    apply_error = st.session_state.pop(f"{p}llm_zcode_apply_error", None)
+    if apply_error:
+        st.error(f"Could not switch the ZCode model: {apply_error}")
 
     st.checkbox(
         "Hardened sandbox (Seatbelt)",
@@ -1093,6 +1123,14 @@ def _render_oai_controls(prefix, saved_llm):
     panel_endpoint = saved_llm.get(endpoint_key, "")
     if not panel_endpoint and last_used_endpoint:
         panel_endpoint = last_used_endpoint
+
+    # Pre-mount seed: a fresh session (no selectbox key yet) reopens on the
+    # last-used endpoint, not on options[0] — the registry's first-inserted
+    # entry — which once sent messages to the WRONG endpoint with its stored
+    # key. Same pattern as the model seeding below and
+    # _seed_openrouter_last_model; a selection already made this run wins.
+    if panel_endpoint and endpoint_key not in st.session_state:
+        st.session_state[endpoint_key] = panel_endpoint
 
     # Preserve a prior selection no longer in the known list so the selectbox
     # never errors on a missing value.

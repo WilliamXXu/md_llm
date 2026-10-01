@@ -421,5 +421,83 @@ class OpenRouterSendMemoryTests(unittest.TestCase):
         self.assertEqual(llm_s, {})
 
 
+class OAISendMemoryTests(unittest.TestCase):
+    """_build_stream's OpenAI-compatible branch: the registry stores only a
+    key the user typed this session. The env-var fallback (OPENAI_API_KEY)
+    must stay write-only — persisting it would silently turn a session
+    secret into one at rest — and a key already in the stored entry is never
+    rewritten redundantly."""
+
+    _KEYS = (
+        "chat_llm_provider",
+        "chat_llm_oai_endpoint",
+        "chat_llm_oai_endpoint_custom",
+        "chat_llm_oai_model_sel",
+        "chat_llm_oai_model",
+        "chat_llm_oai_api_key",
+        "_chat_messages",
+        "_pending_chat_oai_endpoint",
+        "_pending_chat_oai_model_sel",
+    )
+
+    def setUp(self):
+        for k in self._KEYS:
+            st.session_state.pop(k, None)
+        env_patcher = patch.dict(
+            "os.environ", {"OPENAI_API_KEY": "sk-env-secret"}
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        _make_core()
+
+    def tearDown(self):
+        for k in self._KEYS:
+            st.session_state.pop(k, None)
+        core._reset_for_tests(None)
+
+    def _send(self, captured):
+        st.session_state["chat_llm_provider"] = "OpenAI-compatible"
+        st.session_state["chat_llm_oai_endpoint"] = "https://oai.example/v1"
+        st.session_state["chat_llm_oai_model_sel"] = "g-model"
+
+        def fake(messages, **kwargs):
+            captured.update(kwargs)
+            yield "hi"
+
+        with patch.object(chat.llm, "openai_chat_stream", fake):
+            stream, err = chat._build_stream(None, {})
+        self.assertIsNone(err)
+        self.assertEqual("".join(stream), "hi")
+        return core.get_core().load_settings().get("llm") or {}
+
+    def _entry(self, llm_s):
+        reg = llm_s.get("oai_endpoints") or {}
+        return reg.get("https://oai.example/v1") or {}
+
+    def test_typed_key_is_persisted_with_the_endpoint(self):
+        st.session_state["chat_llm_oai_api_key"] = "sk-typed"
+        captured = {}
+        entry = self._entry(self._send(captured))
+        self.assertEqual(entry.get("api_key"), "sk-typed")
+        self.assertEqual(entry.get("last_model"), "g-model")
+        self.assertEqual(captured.get("api_key"), "sk-typed")
+
+    def test_env_fallback_key_is_used_but_never_persisted(self):
+        captured = {}
+        entry = self._entry(self._send(captured))
+        self.assertEqual(captured.get("api_key"), "sk-env-secret")
+        self.assertEqual(entry.get("api_key") or "", "")
+
+    def test_stored_key_is_used_without_a_redundant_rewrite(self):
+        core.get_core().save_settings({"llm": {"oai_endpoints": {
+            "https://oai.example/v1": {"api_key": "sk-stored"},
+        }}})
+        captured = {}
+        entry = self._entry(self._send(captured))
+        self.assertEqual(captured.get("api_key"), "sk-stored")
+        self.assertEqual(entry.get("api_key"), "sk-stored")
+        self.assertEqual(entry.get("last_model"), "g-model")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -79,6 +79,48 @@ class WriteTextTests(unittest.TestCase):
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
 
+class ReadTextFailureTests(unittest.TestCase):
+    """_read_text must distinguish 'exists but unreadable/undecodable'
+    (None) from a genuinely empty file ('') — seeding an editor with ''
+    for a file we failed to read lets a Save truncate it to nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_empty_file_is_empty_string(self):
+        path = os.path.join(self.tmp, "empty.md")
+        open(path, "w").close()
+        self.assertEqual(state._read_text(path), "")
+
+    def test_non_utf8_bytes_are_none_not_empty(self):
+        path = os.path.join(self.tmp, "bin.md")
+        with open(path, "wb") as f:
+            f.write(b"\xff\xfe\x00binary\xff")
+        self.assertIsNone(state._read_text(path))
+
+    def test_missing_path_is_still_empty_string(self):
+        # Backwards compatibility: chat-context sends treat a missing file
+        # as "no context".
+        self.assertEqual(
+            state._read_text(os.path.join(self.tmp, "gone.md")), ""
+        )
+
+    def test_unreadable_file_is_none(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("permission checks are meaningless as root")
+        path = os.path.join(self.tmp, "locked.md")
+        with open(path, "w") as f:
+            f.write("secret")
+        os.chmod(path, 0)
+        try:
+            self.assertIsNone(state._read_text(path))
+        finally:
+            os.chmod(path, 0o644)
+
+
 class DocEditDirtyTests(unittest.TestCase):
     """_doc_edit_dirty needs a Core so the path guard can resolve ``rel``."""
 
@@ -120,6 +162,20 @@ class DocEditDirtyTests(unittest.TestCase):
         st.session_state["_reader_target"] = "gone.md"
         st.session_state[docs.doc_key("_reader_edit_draft", "gone.md")] = "x"
         self.assertTrue(reader._doc_edit_dirty("gone.md"))
+
+    def test_unreadable_file_counts_as_dirty(self):
+        """None (exists but unreadable) != draft → dirty: the draft is then
+        the only copy of that text, matching the docstring's contract."""
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("permission checks are meaningless as root")
+        os.chmod(self.path, 0)
+        try:
+            st.session_state[
+                docs.doc_key("_reader_edit_draft", "notes.md")
+            ] = "edited\n"
+            self.assertTrue(reader._doc_edit_dirty("notes.md"))
+        finally:
+            os.chmod(self.path, 0o644)
 
     def test_draft_key_is_doc_scoped(self):
         st.session_state[
@@ -701,6 +757,119 @@ class ResolveTargetGuardTests(unittest.TestCase):
         save target, so an escape cannot wait behind a file creation."""
         os.symlink(self.tmp, os.path.join(self.allowed, "up"))
         self.assertIsNone(reader._resolve_reader_target("allowed/up/x.md"))
+
+
+class SingleDocSwitchDropsEditorState(unittest.TestCase):
+    """Switching the single-document target must not carry editor state over.
+
+    In single-document mode the editor keys are bare (no ``__doc__`` suffix),
+    so whatever draft/lock/mtime the previous document left behind is read
+    back for the NEW target: the previous document's unsaved draft would
+    render — and, when the two files' mtimes coincide, save silently — into
+    the wrong file. open_in_reader must drop it on a target change (and leave
+    it alone when the host re-opens the same target).
+    """
+
+    def setUp(self):
+        _clear_edit_state()
+        self.tmp = tempfile.mkdtemp()
+        state._write_text(os.path.join(self.tmp, "a.md"), "A on disk\n")
+        state._write_text(os.path.join(self.tmp, "b.md"), "B on disk\n")
+        _reset_for_tests(Core(
+            base_dir=self.tmp,
+            markdown_dirs=(self.tmp,),
+            chat_save_dir=self.tmp,
+        ))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        _reset_for_tests()
+        _clear_edit_state()
+
+    def _seed_a_edit(self):
+        """Session state as if a.md were open in single-doc mode, mid-edit."""
+        st.session_state[reader._READER_TARGET] = "a.md"
+        st.session_state[reader._EDIT_DRAFT] = "A-DRAFT"
+        st.session_state[reader._EDIT_UNLOCKED] = True
+        st.session_state[reader._EDIT_LOCK_TOGGLE] = True
+        st.session_state[reader._EDIT_BASE_MTIME] = 1.0
+        st.session_state[reader._EDIT_PENDING] = "A-PENDING"
+        st.session_state[f"{reader._EDIT_AREA}__g2"] = "A-DRAFT"
+
+    # The bare (unsuffixed) editor keys a switch must sweep.
+    _BARE_KEYS = (
+        "_EDIT_DRAFT", "_EDIT_UNLOCKED", "_EDIT_LOCK_TOGGLE",
+        "_EDIT_BASE_MTIME", "_EDIT_PENDING", "_EDIT_AREA_GEN",
+    )
+
+    def test_switching_target_drops_the_previous_edit_state(self):
+        self._seed_a_edit()
+        reader.open_in_reader("b.md")
+        self.assertEqual(st.session_state[reader._READER_TARGET], "b.md")
+        for name in self._BARE_KEYS:
+            self.assertNotIn(getattr(reader, name), st.session_state)
+        self.assertNotIn(f"{reader._EDIT_AREA}__g2", st.session_state)
+
+    def test_reopening_the_same_target_keeps_its_draft(self):
+        self._seed_a_edit()
+        reader.open_in_reader("a.md")
+        self.assertEqual(st.session_state[reader._READER_TARGET], "a.md")
+        self.assertEqual(st.session_state[reader._EDIT_DRAFT], "A-DRAFT")
+
+    def test_reset_documents_drops_doc_scoped_state(self):
+        """Multi-doc → single-doc must not leave ``__doc__`` keys behind that
+        a later re-open of the same file would resurrect."""
+        docs.add_document("a.md")
+        st.session_state[docs.doc_key("_chat_messages", "a.md")] = [
+            {"role": "user", "content": "hi"},
+        ]
+        st.session_state[docs.doc_key("_reader_edit_draft", "a.md")] = "draft"
+        reader.open_in_reader("b.md")
+        self.assertNotIn(
+            docs.doc_key("_chat_messages", "a.md"), st.session_state
+        )
+        self.assertNotIn(
+            docs.doc_key("_reader_edit_draft", "a.md"), st.session_state
+        )
+
+
+class UnreadableDocumentRenderTests(unittest.TestCase):
+    """An existing-but-unreadable document must gate the whole doc body:
+    rendering an empty document would seed the editor with "" and let a
+    Save truncate the file (the data-loss path this guards)."""
+
+    def test_unreadable_document_renders_error_not_an_editor(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with open(os.path.join(tmp, "bad.md"), "wb") as f:
+            f.write(b"\xff\xfe\x00not-utf8\xff")
+        host = os.path.join(tmp, "host_app.py")
+        with open(host, "w") as f:
+            f.write(
+                "import streamlit as st\n"
+                "import md_llm\n"
+                "\n"
+                f"md_llm.init(md_llm.Core(base_dir={tmp!r},"
+                f" markdown_dirs=({tmp!r},), chat_save_dir={tmp!r}))\n"
+                'md_llm.open_in_reader("bad.md")\n'
+                "md_llm.render_reader()\n"
+            )
+        at = AppTest.from_file(host)
+        at.run()
+        self.assertFalse(at.exception)
+        # The body is gated: no lock toggle (the editor's entry point), no
+        # editor textarea, and no draft was ever seeded from "".
+        self.assertEqual(len(at.toggle), 0)
+        self.assertEqual(len(at.text_area), 0)
+
+        def sget(key):
+            try:
+                return at.session_state[key]
+            except (KeyError, AttributeError):
+                return None
+
+        self.assertIsNone(sget("_reader_edit_draft"))
+        self.assertIsNone(sget("_reader_edit_unlocked"))
 
 
 if __name__ == "__main__":

@@ -174,6 +174,20 @@ class SandboxTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sandbox.seatbelt_profile(link)
 
+    def test_profile_rejects_workdir_root(self):
+        """A "/" workdir puts (subpath "/") into the write allow and the final
+        read re-allow — with last-match-wins that re-opens every tree the
+        blanket denies just closed: a no-op profile presented as Hardened."""
+        with self.assertRaises(ValueError):
+            sandbox.seatbelt_profile("/")
+
+    def test_profile_rejects_workdir_home(self):
+        """Same no-op failure for the home directory itself: every denied
+        credential/personal-data tree lives under it, and the trailing
+        re-allow would override them all."""
+        with self.assertRaises(ValueError):
+            sandbox.seatbelt_profile(os.path.expanduser("~"))
+
     def test_write_seatbelt_profile_propagates_rejection_without_leaving_a_file(self):
         before = set(os.listdir(tempfile.gettempdir()))
         with self.assertRaises(ValueError):
@@ -182,6 +196,60 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(
             [n for n in after - before if n.startswith("md_llm_seatbelt_")], []
         )
+
+
+class SettingsDenyTests(unittest.TestCase):
+    """The settings file stores provider API keys in plaintext and normally
+    sits BESIDE base_dir (e.g. ~/.md_llm/_md_llm_settings.json next to
+    uploads/), so the blanket base_dir deny doesn't cover it — a sandboxed
+    agent could read it and exfiltrate the keys over the allowed network.
+    The profile must deny it by path, after every allow (last-match-wins)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.base_dir = os.path.join(self.tmp, "uploads")
+        os.makedirs(self.base_dir)
+        self.settings = os.path.join(self.tmp, "settings.json")
+
+    def tearDown(self):
+        core._reset_for_tests(None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _register(self, settings_path):
+        core._reset_for_tests(Core(
+            base_dir=self.base_dir,
+            markdown_dirs=(self.base_dir,),
+            chat_save_dir=self.base_dir,
+            settings_path=settings_path,
+        ))
+
+    def test_profile_denies_settings_file_and_its_save_temp(self):
+        self._register(self.settings)
+        profile = sandbox.seatbelt_profile("/tmp/wk/a-b1234")
+        real = os.path.realpath(self.settings)
+        self.assertIn(f'(deny file-read* (subpath "{real}"))', profile)
+        self.assertIn(f'(deny file-read* (literal "{real}.tmp"))', profile)
+        # Last-match-wins: the settings deny must come after every file-read
+        # allow (the trailing network allow is irrelevant to file reads).
+        self.assertGreater(
+            profile.index(f'(deny file-read* (subpath "{real}")'),
+            profile.rindex("(allow file-read*"),
+        )
+
+    def test_profile_without_settings_path_omits_the_rule(self):
+        self._register(None)
+        profile = sandbox.seatbelt_profile("/tmp/wk/a-b1234")
+        # The blanket deny block is multi-line ("(deny file-read*\n   ..."),
+        # so these single-line forms exist only for the settings rules.
+        self.assertNotIn('(deny file-read* (subpath "', profile)
+        self.assertNotIn('(deny file-read* (literal "', profile)
+
+    def test_profile_rejects_settings_path_with_quote(self):
+        """Same fail-closed rule as the workdir: a quote in the settings path
+        would let it inject profile rules."""
+        self._register(os.path.join(self.tmp, 'ev"il.json'))
+        with self.assertRaises(ValueError):
+            sandbox.seatbelt_profile("/tmp/wk/a-b1234")
 
 
 if __name__ == "__main__":

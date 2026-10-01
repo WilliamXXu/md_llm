@@ -26,6 +26,7 @@ no-extra-deps style of transcribe_local.py's remote-Whisper client.
 
 import os
 import atexit
+import codecs
 import json
 import re
 import shutil
@@ -305,21 +306,29 @@ def _iter_stream_lines(response):
     currently available) rather than the buffered ``readline()`` / line-iterator
     path. Under chunked transfer encoding (which OpenRouter's SSE uses), the
     line iterator routes through ``io.IOBase.readline`` backed by an 8 KiB
-    ``BufferedReader`` that greedily pulls as much as the socket has — so a fast
-    reply can land entirely in one batch and the caller never sees a token at a
-    time. ``read1`` returns just the bytes available now, and a partial-line
+    ``BufferedReader`` that greedily pulls as much as the socket has — so a
+    fast reply can land entirely in one batch and the caller never sees a token
+    at a time. ``read1`` returns just the bytes available now, and a partial-line
     buffer here reassembles any line split across reads, so each SSE/NDJSON line
     is yielded the moment the network delivers it.
+
+    Decoding goes through an incremental UTF-8 decoder: a multi-byte character
+    split across two ``read1`` chunks waits in the decoder for its continuation
+    bytes instead of being replaced with U+FFFD by a per-chunk
+    ``decode(errors="replace")`` — TCP segments split CJK characters routinely
+    on long streams, and the per-chunk version turned them into mojibake.
     """
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     buf = ""
     while True:
         chunk = response.read1(4096)
         if not chunk:
             break
-        buf += chunk.decode("utf-8", errors="replace")
+        buf += decoder.decode(chunk)
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
             yield line
+    buf += decoder.decode(b"", True)
     if buf:
         yield buf
 
@@ -1094,6 +1103,24 @@ def _seatbelt_wrap(args, workdir):
     return ["sandbox-exec", "-f", profile_path, binary] + args[1:], profile_path
 
 
+# The agent CLIs auto-approve bash/read/edit tools, so they must not inherit
+# the provider API keys the md_llm host consumes: the Seatbelt profile denies
+# credential *files*, but the environment bypasses it entirely and a
+# prompt-injected ``printenv`` reads the keys straight out. Only the secrets
+# md_llm itself consumes are stripped — the agent CLIs' own auth may
+# legitimately arrive via env vars (each documents env-based setup).
+_AGENT_ENV_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY")
+
+
+def _agent_child_env():
+    """The parent environment minus the provider API keys md_llm consumes."""
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _AGENT_ENV_SECRET_KEYS
+    }
+
+
 # --- live agent subprocess registry (Stop-reply support) --------------------
 #
 # The chat panel's Stop button must be able to kill a wedged agent read
@@ -1241,16 +1268,16 @@ def opencode_chat_stream(
 
     # Wrap in a macOS Seatbelt profile when hardened mode is requested and the
     # host can enforce it; elsewhere (or without sandbox-exec) run unconfined.
+    # Profile generation errors propagate: a sandbox the user asked for that
+    # cannot be created must fail the run, never silently run it unconfined.
     profile_path = None
     if hardened and sandbox.seatbelt_available():
-        try:
-            args, profile_path = _seatbelt_wrap(args, workdir)
-        except OSError:
-            profile_path = None  # degrade to unconfined rather than fail
+        args, profile_path = _seatbelt_wrap(args, workdir)
 
     try:
         proc = subprocess.Popen(
             args,
+            env=_agent_child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1457,16 +1484,16 @@ def cline_chat_stream(
 
     # Wrap in a macOS Seatbelt profile when hardened mode is requested and the
     # host can enforce it; elsewhere (or without sandbox-exec) run unconfined.
+    # Profile generation errors propagate: a sandbox the user asked for that
+    # cannot be created must fail the run, never silently run it unconfined.
     profile_path = None
     if hardened and sandbox.seatbelt_available():
-        try:
-            args, profile_path = _seatbelt_wrap(args, workdir)
-        except OSError:
-            profile_path = None  # degrade to unconfined rather than fail
+        args, profile_path = _seatbelt_wrap(args, workdir)
 
     try:
         proc = subprocess.Popen(
             args,
+            env=_agent_child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1790,16 +1817,16 @@ def zcode_chat_stream(
 
     # Wrap in a macOS Seatbelt profile when hardened mode is requested and the
     # host can enforce it; elsewhere (or without sandbox-exec) run unconfined.
+    # Profile generation errors propagate: a sandbox the user asked for that
+    # cannot be created must fail the run, never silently run it unconfined.
     profile_path = None
     if hardened and sandbox.seatbelt_available():
-        try:
-            args, profile_path = _seatbelt_wrap(args, workdir)
-        except OSError:
-            profile_path = None  # degrade to unconfined rather than fail
+        args, profile_path = _seatbelt_wrap(args, workdir)
 
     try:
         proc = subprocess.Popen(
             args,
+            env=_agent_child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

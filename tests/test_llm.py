@@ -1096,5 +1096,94 @@ class KillAgentProcTests(unittest.TestCase):
         self.assertEqual(llm._LIVE_AGENT_PROCS, {})
 
 
+class _ChunkedResponse:
+    """Stand-in for an HTTPResponse: read1() replays scripted chunks."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def read1(self, size=-1):
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+class IterStreamLinesTests(unittest.TestCase):
+    """_iter_stream_lines must decode UTF-8 incrementally, not per chunk."""
+
+    def test_multibyte_char_split_across_chunks_survives(self):
+        """Regression: per-chunk decode(errors='replace') turned a CJK char
+        straddling a read1 boundary into U+FFFD — silent mojibake, and TCP
+        segments split multi-byte characters routinely on long streams. The
+        incremental decoder holds the partial bytes until they complete."""
+        ni_hao = "你好".encode()  # 6 bytes; cut after 你's 2nd byte
+        resp = _ChunkedResponse([b'{"t": "' + ni_hao[:2], ni_hao[2:] + b'"}\n'])
+        self.assertEqual(list(llm._iter_stream_lines(resp)), ['{"t": "你好"}'])
+
+    def test_partial_final_line_is_yielded_at_eof(self):
+        resp = _ChunkedResponse([b"line1\nlin", b"e2"])
+        self.assertEqual(
+            list(llm._iter_stream_lines(resp)), ["line1", "line2"]
+        )
+
+
+class AgentChildEnvTests(unittest.TestCase):
+    """Agent CLIs auto-approve bash, so they must not inherit the provider
+    API keys the md_llm host consumes: the Seatbelt profile denies credential
+    FILES, but the environment bypasses it entirely."""
+
+    def test_drops_only_the_keys_md_llm_consumes(self):
+        env = {
+            "PATH": "/usr/bin",
+            "HOME": "/tmp",
+            "SSH_AUTH_SOCK": "/sock",
+            "OPENAI_API_KEY": "sk-secret",
+            "OPENROUTER_API_KEY": "or-secret",
+        }
+        with mock.patch.dict(llm.os.environ, env, clear=True):
+            child = llm._agent_child_env()
+        self.assertNotIn("OPENAI_API_KEY", child)
+        self.assertNotIn("OPENROUTER_API_KEY", child)
+        # Everything else — including the agent CLIs' own auth env — stays.
+        self.assertEqual(
+            child, {"PATH": "/usr/bin", "HOME": "/tmp", "SSH_AUTH_SOCK": "/sock"}
+        )
+
+    def test_opencode_popen_receives_the_filtered_env(self):
+        captured = {}
+
+        def fake_popen(args, **kwargs):
+            captured["kwargs"] = kwargs
+            return _FakeOpencodeProc(
+                [json.dumps({"type": "text", "part": {"text": "ok"}})]
+            )
+
+        with mock.patch("subprocess.Popen", side_effect=fake_popen), \
+             mock.patch.dict(
+                 "os.environ",
+                 {"OPENAI_API_KEY": "sk-secret", "HOME": "/h"},
+                 clear=True,
+             ):
+            list(llm.opencode_chat_stream("hi", model="m"))
+        env = captured["kwargs"]["env"]
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertEqual(env["HOME"], "/h")
+
+
+class HardenedFailClosedTests(unittest.TestCase):
+    """A sandbox the user asked for that cannot be generated must fail the
+    run, never silently degrade it to an unconfined auto-approved agent."""
+
+    def test_profile_write_failure_propagates(self):
+        with mock.patch.object(llm.sandbox, "seatbelt_available",
+                               return_value=True), \
+             mock.patch.object(llm.shutil, "which",
+                               return_value="/usr/local/bin/opencode"), \
+             mock.patch.object(llm.sandbox, "write_seatbelt_profile",
+                               side_effect=OSError("no space left")), \
+             mock.patch("subprocess.Popen",
+                        side_effect=AssertionError("must not spawn unconfined")):
+            with self.assertRaises(OSError):
+                list(llm.opencode_chat_stream("hi", model="m", hardened=True))
+
+
 if __name__ == "__main__":
     unittest.main()

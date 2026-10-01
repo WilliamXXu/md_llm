@@ -478,15 +478,28 @@ def _stage_new_uploads(uploaded):
         fid = _upload_file_id(u)
         if fid in seen:
             continue
-        dest = _UPLOADS_DIR / u.name
+        # The multipart name is client-supplied and Streamlit does not
+        # sanitize it server-side, so stage the bare basename only — a
+        # crafted "../x" name must never write outside _UPLOADS_DIR (the
+        # Reader's path guard would refuse to open it, but the write would
+        # already have happened). An all-traversal name ("..") has no
+        # basename at all.
+        safe = Path(u.name).name
+        if not safe:
+            st.error(f"Could not stage file: refusing unsafe name {u.name!r}")
+            continue
+        dest = _UPLOADS_DIR / safe
         try:
             with open(dest, "wb") as f:
                 f.write(u.getvalue())
-        except OSError as e:
+        except (OSError, ValueError) as e:
+            # Record the files that did land before stopping, so the rerun
+            # doesn't re-stage and re-open them.
+            st.session_state[_LAST_UPLOAD_KEY] = fresh
             st.error(f"Could not stage file: {e}")
             st.stop()
-        md_llm.open_in_reader(u.name, keep_open=True)
-        fresh[fid] = u.name
+        md_llm.open_in_reader(safe, keep_open=True)
+        fresh[fid] = safe
     st.session_state[_LAST_UPLOAD_KEY] = fresh
 
 

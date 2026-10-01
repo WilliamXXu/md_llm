@@ -679,5 +679,117 @@ class RememberClineModelTests(unittest.TestCase):
         self.assertEqual(self._saved().get("llm_cline_models", []), [])
 
 
+class OaiEndpointSeedTests(unittest.TestCase):
+    """A fresh session must reopen on the LAST-USED OpenAI-compatible
+    endpoint, not on the registry's first-inserted entry (the selectbox's
+    options[0] default) — the old behavior sent messages to the WRONG
+    endpoint, with that endpoint's stored key."""
+
+    _KEYS = (
+        "llm_oai_endpoint",
+        "llm_oai_endpoint_custom",
+        "llm_oai_model_sel",
+        "llm_oai_api_key",
+    )
+
+    _SAVED = {
+        "oai_endpoints": {
+            "https://a.example/v1": {
+                "api_key": "k-a", "models": ["m1"], "last_model": "m1",
+            },
+            "https://b.example/v1": {
+                "api_key": "k-b", "models": ["m2"], "last_model": "m2",
+            },
+        },
+        "llm_oai_last_endpoint": "https://b.example/v1",
+    }
+
+    def setUp(self):
+        for k in self._KEYS:
+            st.session_state.pop(k, None)
+
+    def tearDown(self):
+        for k in self._KEYS:
+            st.session_state.pop(k, None)
+
+    def test_fresh_session_seeds_last_used_endpoint(self):
+        controls._render_oai_controls("", self._SAVED)
+        self.assertEqual(
+            st.session_state.get("llm_oai_endpoint"), "https://b.example/v1"
+        )
+
+    def test_selection_already_made_this_run_wins(self):
+        st.session_state["llm_oai_endpoint"] = "https://a.example/v1"
+        controls._render_oai_controls("", self._SAVED)
+        self.assertEqual(
+            st.session_state.get("llm_oai_endpoint"), "https://a.example/v1"
+        )
+
+
+class ZcodeModelApplyTests(unittest.TestCase):
+    """ZCode's model pick must be applied by the selectbox's on_change
+    callback — never by an inline block in the render body. A body-level
+    session write after the widget mounted raises StreamlitAPIException
+    (the old error path crashed), and a body-level apply also reverts any
+    out-of-band /model change on every rerun, forever."""
+
+    _KEYS = ("llm_zcode_model_sel", "llm_zcode_apply_error")
+
+    def setUp(self):
+        for k in self._KEYS:
+            st.session_state.pop(k, None)
+
+    def tearDown(self):
+        for k in self._KEYS:
+            st.session_state.pop(k, None)
+
+    def test_callback_applies_a_real_pick(self):
+        st.session_state["llm_zcode_model_sel"] = "zai/glm-4.6"
+        with mock.patch.object(controls.llm, "set_zcode_model") as apply_model:
+            controls._on_zcode_model_change("")
+        apply_model.assert_called_once_with("zai/glm-4.6")
+        self.assertIsNone(st.session_state.get("llm_zcode_apply_error"))
+
+    def test_callback_ignores_the_noop_label(self):
+        st.session_state["llm_zcode_model_sel"] = (
+            controls.ZCODE_CURRENT_MODEL_LABEL
+        )
+        with mock.patch.object(controls.llm, "set_zcode_model") as apply_model:
+            controls._on_zcode_model_change("")
+        apply_model.assert_not_called()
+
+    def test_callback_failure_resets_selection_and_stages_error(self):
+        """The reset must happen IN the callback (pre-mount); doing it in the
+        render body after the widget instantiated was the old crash."""
+        st.session_state["llm_zcode_model_sel"] = "zai/glm-4.6"
+        with mock.patch.object(controls.llm, "set_zcode_model",
+                               side_effect=RuntimeError("config readonly")), \
+             mock.patch.object(controls.llm, "read_zcode_model",
+                               return_value="zai/glm-4.7"):
+            controls._on_zcode_model_change("")
+        self.assertEqual(
+            st.session_state["llm_zcode_model_sel"], "zai/glm-4.7"
+        )
+        self.assertIn("readonly", st.session_state["llm_zcode_apply_error"])
+
+    def test_render_reconciles_a_stale_selection_to_the_config(self):
+        """A concrete selection differing from the freshly-read config is
+        stale (out-of-band /model change, another panel's pick): the dropdown
+        follows the config. This write is pre-mount and never calls
+        set_zcode_model — the old inline apply block DID, reverting the
+        out-of-band change on every render."""
+        with mock.patch.object(controls.llm, "read_zcode_model",
+                               return_value="zai/glm-4.7"), \
+             mock.patch.object(controls.llm, "list_zcode_model_refs",
+                               return_value=["zai/glm-4.6", "zai/glm-4.7"]), \
+             mock.patch.object(controls.llm, "set_zcode_model") as apply_model:
+            st.session_state["llm_zcode_model_sel"] = "zai/glm-4.6"
+            controls._render_zcode_controls("", {})
+        self.assertEqual(
+            st.session_state["llm_zcode_model_sel"], "zai/glm-4.7"
+        )
+        apply_model.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

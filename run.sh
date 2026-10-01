@@ -17,10 +17,26 @@ fi
 
 # streamlit run needs an actual file path (it has no -m / module flag), so
 # resolve app.py through the installed package rather than hardcoding a path.
-APP=$(python -c "import md_llm.app, os; print(os.path.abspath(md_llm.app.__file__))") || {
-  echo "Could not import md_llm. Run 'pip install -e .' from the repo root first." >&2
+# macOS ships only `python3`; bare `python` exists via pyenv/conda/Homebrew.
+PY="${MD_LLM_PYTHON:-}"
+if [[ -z "$PY" ]]; then
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      PY="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "$PY" ]]; then
+  echo "No python3 on PATH. Install Python 3 (or set MD_LLM_PYTHON)." >&2
+  exit 1
+fi
+APP=$("$PY" -c "import md_llm.app, os; print(os.path.abspath(md_llm.app.__file__))") || {
+  echo "Could not import md_llm with $PY. Run 'pip install -e .' from the repo root first." >&2
   exit 1
 }
+
+PORT=8501
 
 # Sweep stale staged copies from earlier sessions before booting a fresh
 # server. The app stages every document (uploads and Finder-opened files
@@ -32,13 +48,34 @@ APP=$(python -c "import md_llm.app, os; print(os.path.abspath(md_llm.app.__file_
 purge_stale_uploads() {
   find "$HOME/.md_llm/uploads" -maxdepth 1 -type f -delete 2>/dev/null || true
 }
+
+# ... but only purge when a fresh boot really is that moment. The app-bundle
+# server (port 8599) shares ~/.md_llm/uploads, and staged uploads are the
+# ONLY copy of browser-uploaded files — purging while another server's
+# sessions still reference them destroys their open documents. So probe
+# first and refuse rather than wipe.
+port_in_use() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+for p in "$PORT" 8599; do
+  if port_in_use "$p"; then
+    echo "Port $p already has a server on it (md_llm dev or app bundle?)." >&2
+    echo "Refusing to start: the stale-upload purge would destroy that" >&2
+    echo "server's open documents. Quit it first, then re-run this script." >&2
+    exit 1
+  fi
+done
 purge_stale_uploads
 
 LOG=$(mktemp -t md_llm_run)
 trap 'kill "$STREAMLIT_PID" 2>/dev/null || true' EXIT
 
 # Headless = Streamlit will NOT auto-open a browser. We open Chrome ourselves.
-streamlit run "$APP" --server.headless=true >"$LOG" 2>&1 &
+# Bound to loopback and pinned to $PORT (matching the probe above): the panel
+# holds provider API keys and can read the configured markdown dirs, so it is
+# not something to offer to the LAN.
+streamlit run "$APP" --server.headless=true \
+  --server.address=127.0.0.1 --server.port="$PORT" >"$LOG" 2>&1 &
 STREAMLIT_PID=$!
 
 # Wait for Streamlit to print its Local URL, then hand that exact URL to Chrome.

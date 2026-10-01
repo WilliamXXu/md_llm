@@ -293,7 +293,13 @@ def reset_documents():
 
     Used by ``open_in_reader(relpath)`` (without ``keep_open``) so a host that
     stages files one at a time keeps today's exact single-document behaviour.
+    Every open document's namespaced state (its conversation, draft, staged
+    quick prompt) is dropped with it: leaving multi-document mode must not
+    leave ``__doc__``-suffixed keys behind that a later ``add_document`` of
+    the same file would resurrect.
     """
+    for rel in open_documents():
+        _drop_doc_keys(rel)
     st.session_state.pop(_OPEN_DOCS, None)
     st.session_state.pop(_ACTIVE_DOC, None)
     st.session_state.pop(_DOC_SELECT, None)
