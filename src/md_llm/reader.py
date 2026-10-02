@@ -48,6 +48,7 @@ import streamlit.components.v1 as components
 from markdown_it import MarkdownIt
 
 from . import docs
+from .console import log_event
 from .core import get_core
 from .state import (
     _BODY_FONT_SIZE_CSS,
@@ -496,6 +497,11 @@ def _write_doc_edit(rel, target, draft):
     if not _write_text(target, draft):
         st.error(f"Could not write `{target}` — check the file's permissions.")
         return False
+    # Emitted for hosts AND for the bundled app, whose handler turns saves
+    # into `.edited/<name>` markers so the macOS launchers never treat a
+    # staged copy holding real user edits as a disposable working copy (the
+    # exact path a save overwrites is the caption the Reader shows).
+    log_event(f"Document saved: {target}", level="info", source="reader")
     st.session_state.pop(docs.doc_key(_EDIT_DRAFT, rel), None)
     st.session_state.pop(_EDIT_PENDING, None)
     try:

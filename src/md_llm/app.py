@@ -48,6 +48,7 @@ import md_llm
 _WORK_DIR = Path.home() / ".md_llm"
 _UPLOADS_DIR = _WORK_DIR / "uploads"
 _CHATS_DIR = _UPLOADS_DIR / "_chats"
+_EDITED_DIR = _UPLOADS_DIR / ".edited"
 _SETTINGS_PATH = _WORK_DIR / "_md_llm_settings.json"
 _LAST_UPLOAD_KEY = "_app_last_uploaded_name"
 
@@ -73,6 +74,43 @@ def _install_core():
         chat_save_dir=str(_CHATS_DIR),
         settings_path=str(_SETTINGS_PATH),
     ))
+
+
+# The Reader's editor saves into the staged copy itself (the path caption in
+# the Reader names it), so a staged file can hold real user work — not just a
+# re-derivable copy of the original. Both macOS launchers re-stage Finder
+# drops with `cp -f` and purge uploads/ on a fresh boot; without a record of
+# "this staged copy was edited in the app", those would silently destroy the
+# edits. So the app listens for the Reader's save events and drops a marker
+# per edited staged copy: uploads/.edited/<name>. The launchers check these
+# markers before overwriting (macos/launcher.sh staging loop) or deleting
+# (purge_stale_uploads in both launchers) a staged file; re-staging the
+# original clears the marker, restoring the old refresh behavior.
+_SAVE_EVENT_PREFIX = "Document saved: "
+
+
+def _on_md_llm_event(msg, level="info", source=""):
+    """Record Reader saves into staged copies as .edited/<name> markers.
+
+    Wired up via md_llm.console.set_logger in main(). Everything but the
+    Reader's save events is ignored here (the app has no console of its own).
+    Best-effort: md_llm.log_event already swallows handler failures, and this
+    handler swallows its own I/O errors — a marker problem must never break a
+    save.
+    """
+    if not isinstance(msg, str) or not msg.startswith(_SAVE_EVENT_PREFIX):
+        return
+    try:
+        p = Path(msg[len(_SAVE_EVENT_PREFIX):])
+        # Only staged copies are protected: saved chats under _chats/ (and
+        # anything outside uploads/) are ordinary files the launchers never
+        # touch.
+        if p.parent.resolve() != _UPLOADS_DIR.resolve() or not p.is_file():
+            return
+        _EDITED_DIR.mkdir(parents=True, exist_ok=True)
+        (_EDITED_DIR / p.name).touch()
+    except (OSError, ValueError):
+        pass
 
 
 def _preserve_reader_scroll():
@@ -507,6 +545,10 @@ def main():
     st.set_page_config(page_title="md_llm", layout="wide", page_icon="📖")
     _ensure_work_dirs()
     _install_core()
+    # Idempotent (the latest registration wins): Reader saves land in
+    # uploads/.edited/ markers the macOS launchers respect (see above).
+    from md_llm.console import set_logger
+    set_logger(_on_md_llm_event)
     _open_query_docs()
 
     with st.sidebar:

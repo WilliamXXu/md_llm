@@ -887,6 +887,55 @@ def _stop_streaming_reply():
     return True
 
 
+def stop_document_streams(rel):
+    """Ask every live background stream of one document's chat sessions to stop.
+
+    The document-close counterpart of :func:`_stop_streaming_reply` (which
+    only reaches the ACTIVE session): closing a document drops all of its
+    sessions' ``_chat_bg_task`` keys, and popping the key alone would orphan
+    the worker thread — for the agent providers, a live auto-approving
+    subprocess with no cancel path. Registered as a docs close hook (see
+    :func:`md_llm.docs.add_close_hook`), so it runs before the keys are
+    dropped no matter which close path fires (sidebar ✕, Reader's Clear,
+    ``remove_document`` / ``reset_documents`` from a host).
+
+    Sessions are found by the same ``_chat_bg_task`` + ``__doc__<rel>`` key
+    pattern the close sweep uses — deliberately registry-independent, so a
+    stream is stopped even if the session registry was already mutated.
+    Returns True when at least one running task was flagged. The reply itself
+    is NOT kept: the caller drops the document's keys right after, which is
+    the user's confirmed intent (the close dialog names the in-flight
+    stream).
+    """
+    if not rel:
+        return False  # the "(no document)" bare chat is not a document's
+    suffix = f"__doc__{rel}"
+    stopped_any = False
+    for key in list(st.session_state.keys()):
+        if not (
+            isinstance(key, str)
+            and key.startswith(_CHAT_BG_TASK)
+            and key.endswith(suffix)
+        ):
+            continue
+        task = st.session_state.get(key)
+        if (
+            isinstance(task, dict)
+            and not task.get("done")
+            and not task.get("stop")
+        ):
+            task["stop"] = True
+            llm.kill_agent_proc(task.get("stop_key"))
+            stopped_any = True
+    if stopped_any:
+        log_event(
+            "Document closed with a stream running — the agent behind it "
+            "was asked to stop.",
+            level="info",
+        )
+    return stopped_any
+
+
 @st.fragment(run_every=0.4)
 def _stream_partial_reply(task):
     """Live-view an in-flight background stream, re-rendering only this bubble.
@@ -1949,3 +1998,12 @@ def render_chat():
             st.session_state[_chat_state_key(_CHAT_BG_TASK)] = task
             worker.start()
         st.rerun()
+
+
+# Closing a document must also stop its in-flight background streams (the
+# agent subprocesses behind them keep running and spending otherwise). The
+# hook runs for every close path because all of them funnel through
+# docs.remove_document / docs.reset_documents. Registered at import so any
+# host that renders the chat panel gets the teardown for free;
+# docs.add_close_hook is idempotent.
+docs.add_close_hook(stop_document_streams)

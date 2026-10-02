@@ -50,8 +50,18 @@ PID_FILE="$WORK_DIR/server.pid"
 CHROME="${MD_LLM_CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 IDLE_LIMIT="${MD_LLM_IDLE_TIMEOUT:-60}"  # seconds of no open tab before shutdown; 0 disables
 CHECK_INTERVAL=60                         # idle-poll granularity
+# run.sh's port — its dev sessions share this uploads dir. Keep in sync with
+# run.sh's purge guard, which probes both ports (this one and its own) for
+# the same reason in the other direction.
+DEV_PORT="${MD_LLM_DEV_PORT:-8501}"
 
 mkdir -p "$UPLOADS_DIR"
+
+# run.sh's probe (keep the two in sync). A plain TCP connect: anything
+# accepting on the port counts.
+port_in_use() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
 
 # The Streamlit app serves a static index titled "Streamlit"; requiring it
 # rules out an unrelated (or older, pre-Streamlit md_llm) server squatting on
@@ -65,10 +75,17 @@ health() {
 # is about to boot the server itself. Open documents live in the server
 # process's per-tab session memory, so a fresh boot is the one moment nothing
 # can reference them; a running server is never disturbed mid-session. Only
-# top-level regular files are deleted: _chats/ (saved chat histories) and
-# every other directory inside uploads is never touched.
+# top-level regular files are deleted: _chats/ (saved chat histories), every
+# other directory inside uploads, and the .edited marker directory are never
+# touched. A staged copy with an edit marker (the Reader's editor saves into
+# the staged copy itself — see the staging loop below) is real user work, not
+# a disposable working copy: it survives the purge until re-staged from its
+# original (which clears the marker) or deleted by hand.
 purge_stale_uploads() {
-  find "$UPLOADS_DIR" -maxdepth 1 -type f -delete 2>/dev/null || true
+  [ -d "$UPLOADS_DIR" ] || return 0
+  find "$UPLOADS_DIR" -maxdepth 1 -type f 2>/dev/null | while IFS= read -r f; do
+    [ -e "$UPLOADS_DIR/.edited/${f##*/}" ] || rm -f "$f" 2>/dev/null || true
+  done
 }
 
 # Idle reaper. Every browser tab holds one WebSocket to the server, so "a
@@ -171,7 +188,17 @@ EOF
     echo "Stop it or set MD_LLM_PORT, then retry." >&2
     exit 1
   fi
-  purge_stale_uploads
+  # Mirror of run.sh's guard: the dev server (run.sh, port $DEV_PORT) shares
+  # this uploads dir, and browser-uploaded documents exist ONLY as their
+  # staged copies — purging while a dev session is open destroys its
+  # documents. Booting on $PORT is still safe (nothing references this
+  # port), so skip the purge and continue rather than refuse.
+  if port_in_use "$DEV_PORT"; then
+    echo "note: something is serving on port $DEV_PORT (the run.sh dev server?) —" >&2
+    echo "skipping the stale-upload purge so its open documents survive." >&2
+  else
+    purge_stale_uploads
+  fi
   # Detached: the server must outlive this launcher, which exits right after
   # opening the browser tab.
   nohup "$PY" -m streamlit run "$APP" \
@@ -203,13 +230,34 @@ EOF
 fi
 
 # Stage copies. Basename only (the app opens files from the flat uploads
-# dir); copying under the original name means re-opening an edited file
-# refreshes the staged copy, so the overwrite is the point.
+# dir). Copying under the original name refreshes the staged copy from the
+# original — but only when the staged copy is still just a copy: the Reader's
+# editor saves into the staged file itself (the app records each such save as
+# uploads/.edited/<name>, see md_llm.app), and clobbering that with the
+# original would destroy real user edits with no confirmation. So a staged
+# copy with an edit marker is never overwritten: it is opened as-is (the
+# browser gets the edited content) and the warning says so. Re-staging after
+# you've reconciled the two by hand: delete the marker (or the staged copy),
+# or edit the marker-free original first.
 DOCS=()
 for doc in "$@"; do
   [ -f "$doc" ] || continue
-  DOCS+=("$doc")
-  cp -f "$doc" "$UPLOADS_DIR/$(basename "$doc")" || true
+  base=$(basename "$doc")
+  staged="$UPLOADS_DIR/$base"
+  if [ -e "$UPLOADS_DIR/.edited/$base" ] && [ -f "$staged" ]; then
+    echo "warning: '$base' has in-app edits saved on top of the staged copy;" >&2
+    echo "not overwriting it with $doc — the browser will open the edited copy." >&2
+    DOCS+=("$doc")
+    continue
+  fi
+  if cp -f "$doc" "$staged"; then
+    rm -f "$UPLOADS_DIR/.edited/$base"  # fresh copy: an old marker is stale
+    DOCS+=("$doc")
+  else
+    # A failed stage must not be advertised: the URL would open a stale or
+    # absent staged copy under this name.
+    echo "warning: could not stage '$doc' — it will not be opened." >&2
+  fi
 done
 
 URL="$BASE_URL/"

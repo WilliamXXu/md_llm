@@ -42,7 +42,10 @@ the reader's ``_reader_target`` key by literal string (the same string-literal
 convention ``_reader_quick_prompt`` already uses between reader.py and
 chat.py), and
 it cleans up per-document keys by their ``__doc__<relpath>`` suffix rather than
-naming them individually.
+naming them individually. Teardown work that IS chat's business (stopping an
+in-flight background stream) is not reimplemented here: chat.py registers a
+close hook (:func:`add_close_hook`) that runs just before a document's keys
+are dropped.
 """
 
 from __future__ import annotations
@@ -257,6 +260,43 @@ def set_active_document(rel):
         st.session_state.pop("_reader_target", None)
 
 
+# ---------------------------------------------------------------------------
+# Close hooks: teardown work owned by other panels, run at document close
+# ---------------------------------------------------------------------------
+#
+# Dropping a document's session keys (``_drop_doc_keys``) also drops its
+# background stream task — but popping the key does not stop the worker
+# thread behind it, and for the agent providers (OpenCode/Cline/ZCode) that
+# thread drives a live, auto-approving subprocess. So before the keys go,
+# registered hooks get a chance to wind down what they own. chat.py registers
+# a stream-stopper here (see chat.stop_document_streams); this module never
+# imports chat, keeping the dependency direction panel → docs.
+
+_close_hooks: list = []
+
+
+def add_close_hook(fn):
+    """Register a callable run as ``fn(rel)`` just before ``rel``'s per-document
+    session keys are dropped (by :func:`remove_document` /
+    :func:`reset_documents`).
+
+    Idempotent (the same callable is registered once). Hooks run best-effort:
+    an exception in one is swallowed so a teardown failure can never block the
+    close or break the other hooks.
+    """
+    if fn not in _close_hooks:
+        _close_hooks.append(fn)
+
+
+def _run_close_hooks(rel):
+    """Run every registered close hook for ``rel``, ignoring failures."""
+    for fn in list(_close_hooks):
+        try:
+            fn(rel)
+        except Exception:  # noqa: BLE001 — teardown must never block a close
+            pass
+
+
 def remove_document(rel):
     """Close ``rel``: drop its per-document state and activate a fallback.
 
@@ -267,6 +307,7 @@ def remove_document(rel):
     reg = st.session_state.get(_OPEN_DOCS)
     if not isinstance(reg, dict):
         return
+    _run_close_hooks(rel)
     reg.pop(rel, None)
     _drop_doc_keys(rel)
     if not reg:
@@ -299,6 +340,7 @@ def reset_documents():
     the same file would resurrect.
     """
     for rel in open_documents():
+        _run_close_hooks(rel)
         _drop_doc_keys(rel)
     st.session_state.pop(_OPEN_DOCS, None)
     st.session_state.pop(_ACTIVE_DOC, None)
@@ -514,6 +556,29 @@ def doc_chat_has_messages(rel):
     return False
 
 
+def doc_chat_streaming(rel):
+    """True when any chat session of ``rel`` has an in-flight background stream.
+
+    Used by :func:`close_document` so the warning names the live reply (and,
+    behind it, a running agent subprocess) — not just the conversation.
+    Checked by the same literal ``_chat_bg_task`` key + ``__doc__`` suffix the
+    key sweeps use, so it agrees with what a close would drop regardless of
+    the session registry's state. A task counts as in-flight until its
+    ``done`` flag is set (the shape chat.py's worker guarantees).
+    """
+    suffix = f"{_DOC_KEY_SEP}{rel}"
+    for k in st.session_state:
+        if (
+            isinstance(k, str)
+            and k.startswith("_chat_bg_task")
+            and k.endswith(suffix)
+        ):
+            task = st.session_state.get(k)
+            if isinstance(task, dict) and not task.get("done"):
+                return True
+    return False
+
+
 def doc_has_unsaved_edits(rel):
     """True when the Reader holds an unsaved editor draft for ``rel``.
 
@@ -564,14 +629,17 @@ def _confirm_close_document(rel, problems):
 def close_document(rel):
     """Close ``rel`` from a button click, guarding unsaved work.
 
-    With a non-empty LLM chat and/or unsaved Reader edits, a confirmation
-    dialog (:func:`_confirm_close_document`) runs first and the document is
-    only closed when the user proceeds; otherwise the document closes
-    immediately, exactly like ``remove_document`` + rerun before.
+    With a non-empty LLM chat, an in-flight stream and/or unsaved Reader
+    edits, a confirmation dialog (:func:`_confirm_close_document`) runs first
+    and the document is only closed when the user proceeds; otherwise the
+    document closes immediately, exactly like ``remove_document`` + rerun
+    before.
     """
     problems = []
     if doc_chat_has_messages(rel):
         problems.append("a non-empty LLM chat")
+    if doc_chat_streaming(rel):
+        problems.append("a streaming LLM reply")
     if doc_has_unsaved_edits(rel):
         problems.append("unsaved Reader edits")
     if problems:

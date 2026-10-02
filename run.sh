@@ -43,17 +43,25 @@ PORT=8501
 # alike) as a top-level file in ~/.md_llm/uploads, and open documents live
 # only in the server process's session memory — so a fresh boot is the one
 # moment nothing references them. Only top-level regular files are deleted:
-# _chats/ (saved chat histories) and any other directory inside uploads is
-# never touched.
+# _chats/ (saved chat histories), any other directory inside uploads, and the
+# .edited marker directory are never touched. A staged copy with an edit
+# marker (the Reader's editor saves into the staged copy itself; the app
+# records each save as uploads/.edited/<name>) is real user work, not a
+# disposable working copy: it survives the purge. Keep this logic in sync
+# with macos/launcher.sh's purge_stale_uploads.
 purge_stale_uploads() {
-  find "$HOME/.md_llm/uploads" -maxdepth 1 -type f -delete 2>/dev/null || true
+  [ -d "$HOME/.md_llm/uploads" ] || return 0
+  find "$HOME/.md_llm/uploads" -maxdepth 1 -type f 2>/dev/null | while IFS= read -r f; do
+    [ -e "$HOME/.md_llm/uploads/.edited/${f##*/}" ] || rm -f "$f" 2>/dev/null || true
+  done
 }
 
 # ... but only purge when a fresh boot really is that moment. The app-bundle
 # server (port 8599) shares ~/.md_llm/uploads, and staged uploads are the
 # ONLY copy of browser-uploaded files — purging while another server's
 # sessions still reference them destroys their open documents. So probe
-# first and refuse rather than wipe.
+# first and refuse rather than wipe. (launcher.sh mirrors this guard against
+# THIS script's port before its own purge — keep DEV_PORT there in sync.)
 port_in_use() {
   (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
 }

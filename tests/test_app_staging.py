@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import streamlit as st
 
-from md_llm import app, docs
+from md_llm import app, console, docs, reader
 
 
 class _FakeUpload:
@@ -119,11 +119,99 @@ class StageNewUploadsTests(unittest.TestCase):
         up = _FakeUpload("../evil.md", "fid-trav")
         app._stage_new_uploads([up])
         self.assertEqual(docs.open_documents(), ["evil.md"])
-        self.assertEqual((self._uploads / "evil.md").read_bytes(), b"content")
+        self.assertTrue((self._uploads / "evil.md").read_bytes() == b"content")
         self.assertFalse((self._uploads.parent / "evil.md").exists())
         self.assertEqual(
             st.session_state[app._LAST_UPLOAD_KEY]["fid-trav"], "evil.md"
         )
+
+
+class EditedMarkerTests(unittest.TestCase):
+    """The app's save-event handler: uploads/.edited/<name> markers.
+
+    The Reader's editor saves into the staged copy itself, and the macOS
+    launchers re-stage Finder drops with `cp -f` and purge uploads/ on a
+    fresh boot. The handler turns the Reader's ``Document saved: <path>``
+    events into markers the launchers check before overwriting or deleting a
+    staged file, so an edited copy is never treated as disposable.
+    """
+
+    def setUp(self):
+        _clear_state()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._uploads = Path(self._tmp.name)
+        self._edited = self._uploads / ".edited"
+        for target, value in (
+            ("_UPLOADS_DIR", self._uploads),
+            ("_EDITED_DIR", self._edited),
+        ):
+            patcher = patch.object(app, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        (self._uploads / "notes.md").write_text("staged", encoding="utf-8")
+
+    def tearDown(self):
+        _clear_state()
+
+    def _saved_event(self, name="notes.md"):
+        return f"{app._SAVE_EVENT_PREFIX}{self._uploads / name}"
+
+    def test_save_event_writes_the_marker(self):
+        app._on_md_llm_event(self._saved_event())
+        self.assertTrue((self._edited / "notes.md").is_file())
+
+    def test_marker_dir_is_created_lazily(self):
+        self.assertFalse(self._edited.exists())
+        app._on_md_llm_event(self._saved_event())
+        self.assertTrue(self._edited.is_dir())
+
+    def test_non_staged_paths_are_ignored(self):
+        # Saved chats live under uploads/_chats/ and everything else is
+        # outside uploads entirely — none of it is a staged copy.
+        chats = self._uploads / "_chats"
+        chats.mkdir()
+        (chats / "notes.md").write_text("chat", encoding="utf-8")
+        outside = self._tmp.name + "-elsewhere"
+        Path(outside).mkdir()
+        (Path(outside) / "notes.md").write_text("x", encoding="utf-8")
+        app._on_md_llm_event(f"{app._SAVE_EVENT_PREFIX}{chats / 'notes.md'}")
+        app._on_md_llm_event(f"{app._SAVE_EVENT_PREFIX}{Path(outside) / 'notes.md'}")
+        self.assertFalse(self._edited.exists())
+
+    def test_other_events_and_garbage_are_ignored(self):
+        app._on_md_llm_event("Chat reply (12 chars)")
+        app._on_md_llm_event("Document saved: ")          # empty path
+        app._on_md_llm_event("Document saved: ../evil")   # not in uploads
+        app._on_md_llm_event(None)                        # not a string
+        self.assertFalse(self._edited.exists())
+
+    def test_io_errors_never_raise_out_of_the_handler(self):
+        # An embedded NUL byte makes Path resolution raise ValueError — the
+        # handler must swallow it (md_llm.log_event would anyway).
+        app._on_md_llm_event(f"{app._SAVE_EVENT_PREFIX}bad\0name")
+
+    def test_reader_save_event_flows_end_to_end(self):
+        """A real Reader save (reader._write_doc_edit) lands the marker."""
+        (self._uploads / "notes.md").write_text("on disk", encoding="utf-8")
+        console.set_logger(app._on_md_llm_event)
+        self.addCleanup(console.set_logger, None)
+        with patch.object(reader.st, "toast"):
+            self.assertTrue(
+                reader._write_doc_edit(
+                    "", str(self._uploads / "notes.md"), "edited draft"
+                )
+            )
+        self.assertEqual(
+            (self._uploads / "notes.md").read_text(encoding="utf-8"),
+            "edited draft",
+        )
+        self.assertTrue((self._edited / "notes.md").is_file())
+        # And the marker is cleared when the launcher re-stages the original
+        # — simulated here by removing the marker the way launcher.sh's
+        # staging loop does after a successful cp.
+        (self._edited / "notes.md").unlink()
+        self.assertFalse((self._edited / "notes.md").exists())
 
 
 if __name__ == "__main__":

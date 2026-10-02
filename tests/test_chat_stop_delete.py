@@ -427,5 +427,145 @@ class StopAndDeleteButtonKeyTests(unittest.TestCase):
             self.assertNotIn(key, set(chat._chat_control_keys()))
 
 
+class DocumentCloseStopsStreamsTests(unittest.TestCase):
+    """Closing a document stops its sessions' in-flight background streams.
+
+    Popping the ``_chat_bg_task`` keys alone would orphan the worker thread —
+    for the agent providers, a live auto-approving subprocess with no cancel
+    path. ``chat.stop_document_streams`` is registered as a docs close hook,
+    so every close path (sidebar ✕, Reader's Clear, host's ``remove_document``
+    / ``reset_documents``) stops the streams before the keys are dropped.
+    """
+
+    def setUp(self):
+        _clear_keys()
+        self.tmp = tempfile.mkdtemp(prefix="mdllm_docclose_")
+        _reset_for_tests(Core(
+            base_dir=self.tmp,
+            markdown_dirs=(self.tmp,),
+            chat_save_dir=self.tmp,
+        ))
+        docs.add_document("notes.md")
+
+    def tearDown(self):
+        _clear_keys()
+        _reset_for_tests()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _s2_task_key(self):
+        return docs.chat_key(chat._CHAT_BG_TASK, 2, "notes.md")
+
+    def test_flags_every_session_and_kills_each_agent_proc(self):
+        s1 = _task(stop_key="tok-1")
+        s2 = _task(stop_key="tok-2")
+        st.session_state["_chat_bg_task__doc__notes.md"] = s1
+        st.session_state[self._s2_task_key()] = s2
+        with patch.object(chat.llm, "kill_agent_proc") as kill:
+            self.assertTrue(chat.stop_document_streams("notes.md"))
+        self.assertTrue(s1["stop"])
+        self.assertTrue(s2["stop"])
+        kill.assert_any_call("tok-1")
+        kill.assert_any_call("tok-2")
+        self.assertEqual(kill.call_count, 2)
+
+    def test_skips_done_and_already_stopping_tasks(self):
+        done = _task(done=True, stop_key="tok-done")
+        stopping = _task(stop=True, stop_key="tok-stopping")
+        st.session_state["_chat_bg_task__doc__notes.md"] = done
+        st.session_state[self._s2_task_key()] = stopping
+        with patch.object(chat.llm, "kill_agent_proc") as kill:
+            self.assertFalse(chat.stop_document_streams("notes.md"))
+        kill.assert_not_called()
+        self.assertFalse(done.get("stop"))
+        self.assertFalse(stopping.get("stopped"))
+
+    def test_ignores_other_documents_and_the_bare_chat(self):
+        docs.add_document("other.md")
+        st.session_state["_chat_bg_task__doc__other.md"] = _task(
+            stop_key="tok-other"
+        )
+        st.session_state["_chat_bg_task"] = _task(stop_key="tok-bare")
+        with patch.object(chat.llm, "kill_agent_proc") as kill:
+            self.assertFalse(chat.stop_document_streams("notes.md"))
+        kill.assert_not_called()
+        self.assertFalse(
+            st.session_state["_chat_bg_task__doc__other.md"]["stop"]
+        )
+        self.assertFalse(st.session_state["_chat_bg_task"]["stop"])
+
+    def test_bare_rel_never_touches_the_no_document_chat(self):
+        bare = _task(stop_key="tok-bare")
+        st.session_state["_chat_bg_task"] = bare
+        with patch.object(chat.llm, "kill_agent_proc") as kill:
+            self.assertFalse(chat.stop_document_streams(""))
+            self.assertFalse(chat.stop_document_streams(None))
+        kill.assert_not_called()
+        self.assertFalse(bare["stop"])
+
+    def test_remove_document_runs_the_registered_close_hook(self):
+        s1 = _task(stop_key="tok-1")
+        st.session_state["_chat_bg_task__doc__notes.md"] = s1
+        with patch.object(chat.llm, "kill_agent_proc") as kill:
+            docs.remove_document("notes.md")
+        self.assertTrue(s1["stop"])
+        kill.assert_called_once_with("tok-1")
+        # The close still drops the keys (the stream was stopped first).
+        self.assertNotIn("_chat_bg_task__doc__notes.md", st.session_state)
+
+    def test_reset_documents_runs_the_close_hook_per_document(self):
+        docs.add_document("a.md")
+        docs.add_document("b.md")
+        tasks = {}
+        for rel in ("notes.md", "a.md", "b.md"):
+            tasks[rel] = _task(stop_key=f"tok-{rel}")
+            st.session_state[f"_chat_bg_task__doc__{rel}"] = tasks[rel]
+        with patch.object(chat.llm, "kill_agent_proc"):
+            docs.reset_documents()
+        for task in tasks.values():
+            self.assertTrue(task["stop"])
+        self.assertEqual(docs.open_documents(), [])
+
+    def test_a_raising_close_hook_does_not_block_the_close(self):
+        def boom(rel):
+            raise RuntimeError("boom")
+
+        docs.add_close_hook(boom)
+        try:
+            docs.remove_document("notes.md")  # must not raise
+        finally:
+            docs._close_hooks.remove(boom)
+        self.assertNotIn("notes.md", docs.open_documents())
+
+    def test_close_hook_registration_is_idempotent(self):
+        n = len(docs._close_hooks)
+        docs.add_close_hook(chat.stop_document_streams)
+        self.assertEqual(len(docs._close_hooks), n)
+
+
+class DocumentCloseDialogGuardTests(unittest.TestCase):
+    """docs.doc_chat_streaming: the close warning names an in-flight stream."""
+
+    def setUp(self):
+        _clear_keys()
+
+    def tearDown(self):
+        _clear_keys()
+
+    def test_streaming_follows_the_task_lifecycle(self):
+        self.assertFalse(docs.doc_chat_streaming("notes.md"))
+        st.session_state["_chat_bg_task__doc__notes.md"] = _task()
+        self.assertTrue(docs.doc_chat_streaming("notes.md"))
+        # A finished task is not in-flight…
+        st.session_state["_chat_bg_task__doc__notes.md"] = _task(done=True)
+        self.assertFalse(docs.doc_chat_streaming("notes.md"))
+        # …and another document's task never counts.
+        st.session_state["_chat_bg_task__doc__other.md"] = _task()
+        self.assertFalse(docs.doc_chat_streaming("notes.md"))
+
+    def test_non_dict_task_value_is_tolerated(self):
+        st.session_state["_chat_bg_task__doc__notes.md"] = "garbage"
+        self.assertFalse(docs.doc_chat_streaming("notes.md"))
+
+
 if __name__ == "__main__":
     unittest.main()
